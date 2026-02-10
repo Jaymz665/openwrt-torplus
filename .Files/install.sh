@@ -24,7 +24,7 @@ run_with_heartbeat() {
 # --- Main TORPlus installation function ---
 install_torplus() {
     echo "Installing required packages..."
-    run_with_heartbeat "opkg update; opkg install tor ca-certificates curl coreutils-base64 snowflake-client obfs4proxy"
+    run_with_heartbeat "opkg update; opkg install tor ca-certificates curl coreutils-base64 obfs4proxy"
     echo "Creating TORPlus LuCI UI..."
 
     # Ensure the directory exists before writing the file
