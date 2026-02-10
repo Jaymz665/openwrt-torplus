@@ -1,8 +1,7 @@
 #!/bin/sh
 
-# PeDitXOS Tools - TORPlus Installer v30.1 (Final Syntax Fix)
-# This version replaces the final multi-line echo with a cat heredoc
-# to prevent shell interpretation issues and resolve syntax errors.
+# PeDitXOS Tools - TORPlus Installer v30.2 (Fixed Edition)
+# Исправлены ошибки создания раздела меню и UCI конфигурации
 
 echo ">>> Starting TORPlus installation..."
 LOG_FILE="/tmp/peditxos_torplus_log.txt"
@@ -31,16 +30,38 @@ install_torplus() {
     mkdir -p /usr/lib/lua/luci/view/torplus
     
     # Check and create the UCI config file if it doesn't exist
-    [ -f /etc/config/torplus ] || uci -q set torplus.settings=torplus
+    if [ ! -f /etc/config/torplus ]; then
+        echo "Creating UCI configuration for torplus..."
+        cat > /etc/config/torplus << 'EOF'
+config settings 'settings'
+    option bridge_type 'obfs4'
+EOF
+    fi
+    
+    # Ensure the settings exist
+    uci -q get torplus.settings >/dev/null 2>&1 || uci set torplus.settings=torplus
     uci -q set torplus.settings.bridge_type='obfs4'
     uci -q commit torplus
 
-    # Write the LuCI controller file
-    mkdir - p /usr/lib/lua/luci/controller
+    # Create main PeDitXOS controller if it doesn't exist
+    if [ ! -f /usr/lib/lua/luci/controller/peditxos.lua ]; then
+        echo "Creating PeDitXOS main controller..."
+        mkdir -p /usr/lib/lua/luci/controller
+        cat > /usr/lib/lua/luci/controller/peditxos.lua << 'EOF'
+module("luci.controller.peditxos", package.seeall)
+
+function index()
+    entry({"admin", "peditxos"}, firstchild(), "PeDitXOS", 60).index = true
+end
+EOF
+    fi
+
+    # Write the TORPlus controller file
+    mkdir -p /usr/lib/lua/luci/controller
     cat > /usr/lib/lua/luci/controller/torplus.lua <<'EoL'
 module("luci.controller.torplus", package.seeall)
 function index()
-    entry({"admin", "peditxos", "torplus"}, template("torplus/main"), "TORPlus", 92).dependent = true
+    entry({"admin", "peditxos", "torplus"}, template("torplus/main"), "TORPlus", 10)
     entry({"admin", "services", "torplus_api"}, call("api_handler")).leaf = true
 end
 function api_handler()
@@ -53,7 +74,7 @@ function api_handler()
         if running then
             -- Retry up to 3 times to fetch the IP, with a small delay
             for i = 1, 3 do
-                local ip_handle = io.popen("curl --socks5 127.0.0.1:9050 -m 5 -s http://ifconfig.me/ip")
+                local ip_handle = io.popen("curl --socks5 127.0.0.1:9050 -m 5 -s http://ifconfig.me/ip 2>/dev/null")
                 if ip_handle then
                     local fetched_ip = ip_handle:read("*a"):gsub("\n", "")
                     ip_handle:close()
@@ -72,7 +93,12 @@ function api_handler()
         luci.http.prepare_content("application/json")
         luci.http.write_json({running = running, ip = ip, bridge = current_bridge})
     elseif action == "toggle" then
-        if (os.execute("pgrep -f '/usr/sbin/tor' >/dev/null 2>&1") == 0) then os.execute("/etc/init.d/tor start > " .. DEBUG_LOG_FILE .. " 2>&1 &") else os.execute("/etc/init.d/tor stop > " .. DEBUG_LOG_FILE .. " 2>&1 &") end
+        local running = (os.execute("pgrep -f '/usr/sbin/tor' >/dev/null 2>&1") == 0)
+        if running then
+            os.execute("/etc/init.d/tor stop > " .. DEBUG_LOG_FILE .. " 2>&1")
+        else
+            os.execute("/etc/init.d/tor start > " .. DEBUG_LOG_FILE .. " 2>&1")
+        end
         luci.http.prepare_content("application/json")
         luci.http.write_json({success=true})
     elseif action == "save_bridge" then
@@ -82,7 +108,7 @@ function api_handler()
         luci.sys.call("echo '--- Debug Log Started: $(date) ---' > " .. DEBUG_LOG_FILE)
         luci.sys.call("echo 'Action: save_bridge, Bridge Type: " .. bridge_type .. "' >> " .. DEBUG_LOG_FILE)
         
-        -- Set UCI value directly via shell to ensure it's written immediately
+        -- Set UCI value
         luci.sys.call("uci set torplus.settings.bridge_type='" .. bridge_type .. "' && uci commit torplus")
         luci.sys.call("echo 'UCI setting saved.' >> " .. DEBUG_LOG_FILE)
 
@@ -100,7 +126,7 @@ function api_handler()
         luci.sys.call("echo -e '" .. torrc_content:gsub("'", "'\\''") .. "' > /etc/tor/torrc")
         luci.sys.call("echo 'torrc file written with new content.' >> " .. DEBUG_LOG_FILE)
         
-        -- Restart Tor service using a stable method
+        -- Restart Tor service
         luci.sys.call("service tor restart >> " .. DEBUG_LOG_FILE .. " 2>&1")
         luci.sys.call("echo 'Tor service restarted.' >> " .. DEBUG_LOG_FILE)
         luci.sys.call("echo '--- Debug Log Finished ---' >> " .. DEBUG_LOG_FILE)
@@ -110,14 +136,17 @@ function api_handler()
     elseif action == "get_debug_log" then
         local content = ""
         local f = io.open(DEBUG_LOG_FILE, "r")
-        if f then content = f:read("*a"); f:close() end
+        if f then 
+            content = f:read("*a") 
+            f:close() 
+        end
         luci.http.prepare_content("application/json")
         luci.http.write_json({ log = content })
     end
 end
 EoL
     
-    # Write the LuCI view file (integrated HTML and JavaScript) with the polling fix
+    # Write the LuCI view file (integrated HTML and JavaScript)
     cat > /usr/lib/lua/luci/view/torplus/main.htm <<'EoL'
 <%+header%>
 <style>
@@ -310,7 +339,7 @@ h2{
 </div>
 
 <script type="text/javascript">
-(function() { // Wrap in a function to avoid polluting global scope
+(function() {
     const connectBtn = document.getElementById('connectBtn');
     const disconnectBtn = document.getElementById('disconnectBtn');
     const statusText = document.getElementById('statusText');
@@ -366,10 +395,9 @@ h2{
                 disconnectBtn.innerText = 'Disconnecting...';
             }
         }
-        // This request is a user action, so it should show the spinner. We keep XHR.get here.
+        
         XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=' + action, null, function(x, data) {
             isApplying = false;
-            // After action, a status update is needed. Let the poller handle it automatically.
         });
     }
 
@@ -377,7 +405,6 @@ h2{
         setBridgeUIState(bridgeType);
         bridgeButtons.forEach(btn => btn.classList.add('disabled'));
 
-        // This request is also a user action, so XHR.get is appropriate.
         XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=save_bridge&bridge_type=' + bridgeType, null, function(x, data) {
             if (data && data.success) {
                 alert('Bridge settings applied. Tor service is restarting...');
@@ -410,9 +437,7 @@ h2{
         });
     });
 
-    // --- START: REVISED POLLING LOGIC ---
-
-    // Initial load to get the current state of everything at once. This uses the spinner.
+    // Initial load
     XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=status', null, function(x, st) {
         if (!st) return;
         setBridgeUIState(st.bridge || 'obfs4');
@@ -426,7 +451,7 @@ h2{
         }
     });
 
-    // Use XHR.poll for silent background polling. Note: interval is in seconds.
+    // Background polling
     XHR.poll(5, '<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=status', null, function(x, st) {
         if (st) {
             updateConnectionUI(st.running, st.ip);
@@ -436,15 +461,12 @@ h2{
     XHR.poll(2, '<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=get_debug_log', null, function(x, data) {
         if (data && data.log) {
             logOutput.textContent = data.log;
-            // Only scroll to bottom if user is already near the bottom
             const isScrolledToBottom = logOutput.scrollHeight - logOutput.clientHeight <= logOutput.scrollTop + 20;
             if(isScrolledToBottom) {
                 logOutput.scrollTop = logOutput.scrollHeight;
             }
         }
     });
-
-    // --- END: REVISED POLLING LOGIC ---
 })();
 </script>
 <%+footer%>
@@ -502,20 +524,21 @@ install_torplus
 
 # Clear LuCI cache and restart uhttpd to display the new page
 echo "Reloading LuCI UI..."
-rm -f /tmp/luci-indexcache
+rm -rf /tmp/luci-*
+rm -f /var/run/luci-indexcache
 /etc/init.d/uhttpd restart
 echo "Operation completed successfully."
 
 # Use cat heredoc for robust multi-line output
 cat << "EOM"
 
-  ______      _____   _      _    _     _____       
- (_____ \    (____ \ (_)_   \ \  / /   / ___ \     
-  _____) )___ _   \ \ _| |_  \ \/ /   | |   | | ___ 
- |  ____/ _  ) |   | | |  _)  )  (    | |   | |/___)
- | |   ( (/ /| |__/ /| | |__ / /\ \   | |___| |___ |
- |_|    \____)_____/ |_|\___)_/  \_\   \_____/(___/ 
-                                                  
-                                       TORPlus by PeDitX
+ ______      _____   _      _    _     _____       
+ (_____ \    (____ \ (_)_   \ \  / /   / ___ \      
+ _____) )___ _   \ \ _| |_  \ \/ /   | |   | | ___ 
+ |  ____/ _  ) |   | | |  _)  )  (    | |   | |/___)
+ | |   ( (/ /| |__/ /| | |__ / /\ \   | |___| |___ |
+ |_|    \____)_____/ |_|\___)_/  \_\   \_____/(___/ 
+                                                    
+                                       TORPlus by PeDitX
 
 EOM
