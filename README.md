@@ -5,7 +5,7 @@
 > ⚡️ **One-line installation command**:
 
 ```bash
-rm -f *.sh && wget https://raw.githubusercontent.com/peditx/openwrt-torplus/refs/heads/main/.Files/install.sh && chmod +x install.sh && sh install.sh
+rm -f *.sh && wget https://raw.githubusercontent.com/jaymz665/openwrt-torplus/refs/heads/main/.Files/install.sh && chmod +x install.sh && sh install.sh
 ```
 
 ---
@@ -100,5 +100,5 @@ curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org
 
 🧾 License
 
-Licensed under PeDitX License
-📢 Telegram Channel: https://t.me/peditx
+Licensed under jaymz665 License
+📢 Telegram Channel: https://t.me/jaymz665
