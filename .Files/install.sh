@@ -12,19 +12,8 @@ install_torplus() {
     opkg update
     
     echo "Installing Tor and dependencies..."
-    opkg install tor ca-certificates curl coreutils-base64
-    
-    echo "Installing Snowflake (includes webtunnel support)..."
-    # Пробуем установить snowflake (лучший вариант для webtunnel)
-    if opkg list | grep -q snowflake; then
-        opkg install snowflake-proxy
-        WEBTUNNEL_CLIENT="/usr/bin/snowflake-client"
-    else
-        echo "Snowflake not in repository. Installing obfs4proxy as fallback..."
-        opkg install obfs4proxy
-        WEBTUNNEL_CLIENT="/usr/bin/obfs4proxy"
-    fi
-    
+    opkg install snowflake-proxy tor ca-certificates curl coreutils-base64
+     
     echo "Installing LuCI dependencies..."
     opkg install luci-base luci-compat luci-lib-ipkg luci-lib-nixio
     
