@@ -32,7 +32,7 @@ install_torplus() {
     
     # Check and create the UCI config file if it doesn't exist
     [ -f /etc/config/torplus ] || uci -q set torplus.settings=torplus
-    uci -q set torplus.settings.bridge_type='snowflake'
+    uci -q set torplus.settings.bridge_type='obfs4'
     uci -q commit torplus
 
     # Write the LuCI controller file
@@ -66,7 +66,7 @@ function api_handler()
         end
         -- Read the current bridge type directly from the system via shell for a guaranteed up-to-date value
         local current_bridge = luci.sys.exec("uci get torplus.settings.bridge_type 2>/dev/null"):gsub("\n","")
-        if current_bridge == "" then current_bridge = "snowflake" end
+        if current_bridge == "" then current_bridge = "obfs4" end
 
         luci.http.prepare_content("application/json")
         luci.http.write_json({running = running, ip = ip, bridge = current_bridge})
@@ -87,12 +87,13 @@ function api_handler()
 
         -- Build and write torrc file
         local torrc_content = "SocksPort 9050\n"
-        if bridge_type == "snowflake" then
-            torrc_content = torrc_content .. "UseBridges 1\nClientTransportPlugin snowflake exec /usr/bin/snowflake-client\nBridge snowflake 192.0.2.1:1"
-        elseif bridge_type == "obfs4" then
+        if bridge_type == "obfs4" then
             torrc_content = torrc_content .. "UseBridges 1\nClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\nBridge obfs4 192.0.2.2:2 cert=ABC iat-mode=0"
         elseif bridge_type == "meek" then
             torrc_content = torrc_content .. "UseBridges 1\nClientTransportPlugin meek exec /usr/bin/meek-client\nBridge meek 192.0.2.3:3 url=https://ajax.aspnetcdn.com/ delay=1000"
+        else
+            -- Default to no bridges if not specified
+            torrc_content = torrc_content .. "UseBridges 0"
         end
 
         luci.sys.call("echo -e '" .. torrc_content:gsub("'", "'\\''") .. "' > /etc/tor/torrc")
@@ -295,9 +296,9 @@ h2{
         </div>
         <label>Change Bridge Type:</label>
         <div class="bridge-btn-group">
-            <button class="bridge-btn" data-bridge-type="snowflake">Snowflake</button>
             <button class="bridge-btn" data-bridge-type="obfs4">obfs4</button>
             <button class="bridge-btn" data-bridge-type="meek">Meek</button>
+            <button class="bridge-btn" data-bridge-type="none">None</button>
         </div>
     </div>
 
@@ -413,7 +414,7 @@ h2{
     // Initial load to get the current state of everything at once. This uses the spinner.
     XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=status', null, function(x, st) {
         if (!st) return;
-        setBridgeUIState(st.bridge || 'snowflake');
+        setBridgeUIState(st.bridge || 'obfs4');
         updateConnectionUI(st.running, st.ip);
     });
     
@@ -453,8 +454,8 @@ EoL
     rm -f /usr/lib/lua/luci/view/torplus_status_section.htm
     echo "" > "$DEBUG_LOG_FILE" # Create and clear the debug log file
 
-    # Write the initial torrc file with Snowflake bridge as default
-    echo -e "SocksPort 9050\nUseBridges 1\nClientTransportPlugin snowflake exec /usr/bin/snowflake-client\nBridge snowflake 192.0.2.1:1" > /etc/tor/torrc
+    # Write the initial torrc file with obfs4 bridge as default
+    echo -e "SocksPort 9050\nUseBridges 1\nClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\nBridge obfs4 192.0.2.2:2 cert=ABC iat-mode=0" > /etc/tor/torrc
     
     # Enable and start the Tor service
     /etc/init.d/tor enable
