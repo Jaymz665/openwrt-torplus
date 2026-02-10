@@ -118,6 +118,7 @@ function api_handler()
         local bridge_type = http.formvalue("bridge_type") or "custom"
         local custom_bridges = http.formvalue("custom_bridges") or ""
         local use_custom = http.formvalue("use_custom") or "1"
+        custom_bridges = custom_bridges:gsub("%+", " ")
         
         sys.call("echo '--- Debug Log Started: $(date) ---' > " .. DEBUG_LOG_FILE)
         sys.call("echo 'Action: save_bridge, Bridge Type: " .. bridge_type .. "' >> " .. DEBUG_LOG_FILE)
