@@ -24,7 +24,7 @@ install_torplus() {
     echo "Installing required packages..."
     run_with_heartbeat "opkg update"
     echo "Installing core packages..."
-    opkg install tor obfs4proxy curl ca-certificates
+    opkg install obfs4proxy tor curl ca-certificates
     echo "Installing LuCI dependencies..."
     opkg install luci-base luci-compat luci-lib-ipkg
     
