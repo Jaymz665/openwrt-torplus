@@ -36,6 +36,7 @@ install_torplus() {
     uci -q commit torplus
 
     # Write the LuCI controller file
+    mkdir - p /usr/lib/lua/luci/controller
     cat > /usr/lib/lua/luci/controller/torplus.lua <<'EoL'
 module("luci.controller.torplus", package.seeall)
 function index()
