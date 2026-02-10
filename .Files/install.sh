@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# PeDitXOS Tools - TORPlus Installer v35.0 (Webtunnel Support)
+# PeDitXOS Tools - TORPlus Installer v35.1 (Webtunnel Support with opkg --dest ram)
 
 echo ">>> Starting TORPlus installation..."
 LOG_FILE="/tmp/peditxos_torplus_log.txt"
@@ -217,9 +217,88 @@ function api_handler()
         http.write_json({log = content})
         
     elseif action == "check_snowflake" then
-        local has_snowflake = nixio.fs.access("/usr/bin/snowflake-client")
+        -- Проверяем несколькими способами
+        local has_snowflake = false
+        local path = ""
+        local version = ""
+        
+        -- Способ 1: Проверяем через which
+        local handle = io.popen("which snowflake-client 2>/dev/null")
+        local which_output = handle:read("*l")
+        handle:close()
+        
+        if which_output and which_output ~= "" then
+            has_snowflake = true
+            path = which_output
+        end
+        
+        -- Способ 2: Проверяем конкретные пути
+        if not has_snowflake then
+            local paths_to_check = {
+                "/usr/bin/snowflake-client",
+                "/usr/sbin/snowflake-client",
+                "/usr/local/bin/snowflake-client",
+                "/bin/snowflake-client"
+            }
+            
+            for _, p in ipairs(paths_to_check) do
+                if nixio.fs.access(p) then
+                    has_snowflake = true
+                    path = p
+                    break
+                end
+            end
+        end
+        
+        -- Способ 3: Ищем в системе
+        if not has_snowflake then
+            local handle = io.popen("find /usr -name '*snowflake*client*' -type f 2>/dev/null | head -1")
+            local found = handle:read("*l")
+            handle:close()
+            
+            if found and found ~= "" then
+                has_snowflake = true
+                path = found
+            end
+        end
+        
+        -- Получаем версию если установлен
+        if has_snowflake and path ~= "" then
+            local handle = io.popen(path .. " --version 2>&1 || echo 'unknown'")
+            version = handle:read("*l") or "unknown"
+            handle:close()
+        end
+        
         http.prepare_content("application/json")
-        http.write_json({installed = has_snowflake})
+        http.write_json({
+            installed = has_snowflake,
+            path = path,
+            version = version,
+            ram = nixio.fs.access("/tmp/snowflake_status")
+        })
+        
+    elseif action == "install_snowflake" then
+        -- Запускаем установщик
+        sys.call("echo 'Starting snowflake installation...' >> " .. DEBUG_LOG_FILE)
+        local result = sys.exec("/usr/bin/install-snowflake-ram 2>&1")
+        
+        -- Проверяем успешность
+        local success = sys.call("which snowflake-client >/dev/null 2>&1") == 0
+        
+        -- Пишем в лог
+        local f = io.open(DEBUG_LOG_FILE, "a")
+        if f then
+            f:write("\n--- Snowflake installation ---\n")
+            f:write(result)
+            f:write("\nSuccess: " .. tostring(success) .. "\n")
+            f:close()
+        end
+        
+        http.prepare_content("application/json")
+        http.write_json({
+            success = success,
+            output = result
+        })
     end
 end
 EoL
@@ -453,6 +532,11 @@ h2{
     overflow-y: auto;
     border: 1px solid #333;
 }
+.snowflake-details {
+    font-size: 11px;
+    color: #aaa;
+    margin-top: 5px;
+}
 </style>
 
 <div class="torplus-container">
@@ -485,7 +569,8 @@ h2{
         <div id="snowflakeInfo" class="snowflake-info">
             <div>
                 <strong>Webtunnel Support:</strong>
-                <span id="snowflakeStatus" class="status not-installed">Not installed</span>
+                <span id="snowflakeStatus" class="status not-installed">Checking...</span>
+                <div id="snowflakeDetails" class="snowflake-details"></div>
             </div>
             <button id="installSnowflakeBtn">Install Snowflake</button>
         </div>
@@ -533,6 +618,7 @@ h2{
     const bridgeTypeButtons = document.querySelectorAll('.bridge-type-btn');
     const snowflakeInfo = document.getElementById('snowflakeInfo');
     const snowflakeStatus = document.getElementById('snowflakeStatus');
+    const snowflakeDetails = document.getElementById('snowflakeDetails');
     const installSnowflakeBtn = document.getElementById('installSnowflakeBtn');
     
     let currentSettings = {
@@ -545,14 +631,25 @@ h2{
 
     function checkSnowflake() {
         XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=check_snowflake', null, function(x, data) {
-            if (data && data.installed) {
-                snowflakeStatus.textContent = 'Installed';
-                snowflakeStatus.className = 'status installed';
-                installSnowflakeBtn.style.display = 'none';
-            } else {
-                snowflakeStatus.textContent = 'Not installed';
-                snowflakeStatus.className = 'status not-installed';
-                installSnowflakeBtn.style.display = 'inline-block';
+            if (data) {
+                if (data.installed) {
+                    snowflakeStatus.textContent = 'Installed';
+                    snowflakeStatus.className = 'status installed';
+                    installSnowflakeBtn.style.display = 'none';
+                    
+                    // Показываем детали
+                    let details = '';
+                    if (data.path) details += 'Path: ' + data.path + '\n';
+                    if (data.version) details += 'Version: ' + data.version;
+                    if (data.ram) details += ' (RAM)';
+                    
+                    snowflakeDetails.textContent = details;
+                } else {
+                    snowflakeStatus.textContent = 'Not installed';
+                    snowflakeStatus.className = 'status not-installed';
+                    installSnowflakeBtn.style.display = 'inline-block';
+                    snowflakeDetails.textContent = 'Required for webtunnel bridges';
+                }
             }
         });
     }
@@ -659,6 +756,29 @@ h2{
         });
     }
 
+    function installSnowflake() {
+        if (confirm('Install snowflake-client in RAM?\nThis will download ~1MB package.\nInstallation will not persist after reboot.')) {
+            installSnowflakeBtn.classList.add('disabled');
+            installSnowflakeBtn.innerText = 'Installing...';
+            
+            XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=install_snowflake', 
+                null, 
+                function(x, data) {
+                    installSnowflakeBtn.classList.remove('disabled');
+                    installSnowflakeBtn.innerText = 'Install Snowflake';
+                    
+                    if (data && data.success) {
+                        alert('Snowflake installed successfully!\n' + (data.output || ''));
+                        checkSnowflake();
+                        setTimeout(loadStatus, 2000);
+                    } else {
+                        alert('Installation failed:\n' + (data.output || 'Unknown error'));
+                    }
+                }
+            );
+        }
+    }
+
     // Event Listeners
     connectBtn.addEventListener('click', function() {
         if (!connectBtn.classList.contains('disabled')) {
@@ -680,8 +800,10 @@ h2{
             // Обновляем placeholder в зависимости от типа
             const type = this.dataset.bridgeType;
             if (type === 'custom') {
+                customBridgesText.disabled = false;
                 customBridgesText.placeholder = 'Paste bridges (obfs4, webtunnel, meek)...';
             } else if (type === 'none') {
+                customBridgesText.disabled = true;
                 customBridgesText.placeholder = 'Bridges disabled (direct connection)';
                 customBridgesText.value = '';
             }
@@ -689,26 +811,7 @@ h2{
     });
     
     saveBridgeBtn.addEventListener('click', saveBridgeSettings);
-    
-    installSnowflakeBtn.addEventListener('click', function() {
-        if (confirm('Install snowflake-client in RAM? This will download ~10MB package.')) {
-            installSnowflakeBtn.classList.add('disabled');
-            installSnowflakeBtn.innerText = 'Installing...';
-            
-            // Запускаем скрипт установки
-            XHR.get('/cgi-bin/luci/admin/services/torplus_api?action=install_snowflake', null, function(x, data) {
-                installSnowflakeBtn.classList.remove('disabled');
-                installSnowflakeBtn.innerText = 'Install Snowflake';
-                
-                if (data && data.success) {
-                    alert('Snowflake installed! Please wait 30 seconds and refresh page.');
-                    setTimeout(checkSnowflake, 10000);
-                } else {
-                    alert('Installation failed. Run manually: /usr/bin/install-snowflake-ram');
-                }
-            });
-        }
-    });
+    installSnowflakeBtn.addEventListener('click', installSnowflake);
 
     // Initial load
     loadStatus();
@@ -779,90 +882,148 @@ EOF
     /etc/init.d/tor enable
     /etc/init.d/tor restart
     
-    # Create snowflake installer script
+    # Create snowflake installer script (using opkg --dest ram)
     cat > /usr/bin/install-snowflake-ram << 'EOF'
 #!/bin/sh
-# Snowflake RAM Installer for mipsel_24kc
+# Snowflake RAM Installer using opkg --dest ram
 
 echo "=== Snowflake RAM Installer ==="
-echo "Installing snowflake-client to RAM..."
+echo "Using opkg --dest ram installation..."
 
-# 1. Create RAM disk
-RAM_DIR="/tmp/snowflake_ram"
-SIZE="15M"
+# 1. Переходим в /tmp
+cd /tmp
 
-echo "1. Creating RAM disk ($SIZE)..."
-mkdir -p $RAM_DIR
-mount -t tmpfs tmpfs $RAM_DIR -o size=$SIZE || {
-    echo "ERROR: Cannot create RAM disk!"
-    exit 1
-}
+# 2. Скачиваем пакет
+echo "1. Downloading snowflake package..."
+PKG_URL="https://downloads.openwrt.org/releases/24.10.0/packages/mipsel_24kc/packages/snowflake-proxy_2.11.0-r1_mipsel_24kc.ipk"
+PKG_FILE="snowflake-proxy_2.11.0-r1_mipsel_24kc.ipk"
 
-# 2. Download snowflake-proxy
-echo "2. Downloading snowflake..."
-cd $RAM_DIR
-SNOWFLAKE_URL="https://downloads.openwrt.org/releases/24.10.0/packages/mipsel_24kc/packages/snowflake-proxy_2.11.0-r1_mipsel_24kc.ipk"
-
-if ! wget --timeout=60 --tries=3 -q -O snowflake.ipk "$SNOWFLAKE_URL"; then
-    echo "ERROR: Cannot download snowflake!"
-    exit 1
+if [ ! -f "$PKG_FILE" ] || [ ! -s "$PKG_FILE" ]; then
+    echo "Downloading from $PKG_URL"
+    wget --timeout=30 --tries=2 -q -O "$PKG_FILE" "$PKG_URL" || {
+        echo "ERROR: Download failed!"
+        echo "Trying alternative mirror..."
+        wget --timeout=30 -q -O "$PKG_FILE" \
+            "https://archive.openwrt.org/releases/24.10.0/packages/mipsel_24kc/packages/snowflake-proxy_2.11.0-r1_mipsel_24kc.ipk" || {
+            echo "FATAL: Cannot download package"
+            exit 1
+        }
+    }
 fi
 
-# 3. Extract only snowflake-client
-echo "3. Extracting snowflake-client..."
-ar x snowflake.ipk 2>/dev/null || {
-    echo "Trying alternative extraction..."
-    tar -xzf snowflake.ipk 2>/dev/null || tar -xf snowflake.ipk 2>/dev/null
-}
-
-if [ -f "data.tar.gz" ]; then
-    tar -xzf data.tar.gz
-elif [ -f "data.tar.xz" ]; then
-    tar -xJf data.tar.xz
-fi
-
-# 4. Find snowflake-client
-echo "4. Finding snowflake-client..."
-SNOWFLAKE_BIN=""
-for path in "usr/bin/snowflake-client" "usr/sbin/snowflake-client"; do
-    if [ -f "$path" ]; then
-        SNOWFLAKE_BIN="$path"
-        break
+# 3. Устанавливаем в RAM с помощью opkg
+echo "2. Installing to RAM with opkg --dest ram..."
+if opkg install --dest ram "$PKG_FILE" 2>&1; then
+    echo "✓ Package installed to RAM via opkg"
+else
+    echo "WARNING: opkg install failed, trying manual extraction..."
+    
+    # Альтернатива: распаковываем вручную
+    mkdir -p /tmp/snowflake_extract
+    cd /tmp/snowflake_extract
+    
+    # .ipk файл это на самом деле .tar.gz
+    if file "/tmp/$PKG_FILE" | grep -q "gzip"; then
+        tar -xzf "/tmp/$PKG_FILE"
+    else
+        tar -xf "/tmp/$PKG_FILE"
     fi
-done
-
-if [ -z "$SNOWFLAKE_BIN" ]; then
-    SNOWFLAKE_BIN=$(find . -name "*snowflake-client*" -type f | head -1)
+    
+    # Ищем snowflake-client в распакованных файлах
+    SNOWFLAKE_BIN=""
+    
+    # Сначала ищем в data.tar.gz/xz
+    for data_file in data.tar.gz data.tar.xz; do
+        if [ -f "$data_file" ]; then
+            echo "Extracting $data_file..."
+            if echo "$data_file" | grep -q "gz"; then
+                tar -xzf "$data_file"
+            else
+                tar -xJf "$data_file"
+            fi
+        fi
+    done
+    
+    # Ищем бинарник
+    SNOWFLAKE_BIN=$(find . -type f -name "*snowflake*client*" 2>/dev/null | head -1)
+    
+    if [ -f "$SNOWFLAKE_BIN" ]; then
+        echo "Found: $SNOWFLAKE_BIN"
+        chmod +x "$SNOWFLAKE_BIN"
+        
+        # Копируем в /usr/bin
+        mkdir -p /usr/bin 2>/dev/null
+        cp "$SNOWFLAKE_BIN" /usr/bin/snowflake-client
+        chmod +x /usr/bin/snowflake-client
+        
+        echo "✓ Manually installed to /usr/bin/snowflake-client"
+    else
+        echo "✗ Cannot find snowflake-client in package"
+        echo "Contents:"
+        find . -type f 2>/dev/null | head -20
+        exit 1
+    fi
 fi
 
-if [ -z "$SNOWFLAKE_BIN" ] || [ ! -f "$SNOWFLAKE_BIN" ]; then
-    echo "ERROR: Cannot find snowflake-client in package!"
-    exit 1
+# 4. Проверяем установку
+echo "3. Verifying installation..."
+
+# Проверяем несколькими способами
+if which snowflake-client >/dev/null 2>&1; then
+    SNOW_PATH=$(which snowflake-client)
+    echo "✓ Found via which: $SNOW_PATH"
+elif [ -f /usr/bin/snowflake-client ]; then
+    echo "✓ Found: /usr/bin/snowflake-client"
+    SNOW_PATH="/usr/bin/snowflake-client"
+elif [ -f /usr/sbin/snowflake-client ]; then
+    echo "✓ Found: /usr/sbin/snowflake-client"
+    SNOW_PATH="/usr/sbin/snowflake-client"
+else
+    echo "✗ snowflake-client not found in PATH"
+    
+    # Ищем в системе
+    echo "Searching system..."
+    FOUND=$(find /usr -name "*snowflake*" -type f 2>/dev/null | head -1)
+    if [ -n "$FOUND" ]; then
+        echo "Found at: $FOUND"
+        ln -sf "$FOUND" /usr/bin/snowflake-client 2>/dev/null
+        SNOW_PATH="/usr/bin/snowflake-client"
+    else
+        echo "ERROR: snowflake-client not found anywhere!"
+        exit 1
+    fi
 fi
 
-# 5. Install
-echo "5. Installing..."
-chmod +x "$SNOWFLAKE_BIN"
-mkdir -p /usr/bin
-ln -sf "$RAM_DIR/$SNOWFLAKE_BIN" /usr/bin/snowflake-client
-
-# 6. Cleanup
-echo "6. Cleaning up..."
-rm -f snowflake.ipk data.tar.gz control.tar.gz debian-binary 2>/dev/null
-
-# 7. Verify
-echo "7. Verifying installation..."
-if [ -f "/usr/bin/snowflake-client" ]; then
-    echo "✓ Snowflake installed successfully!"
-    echo "  Location: /usr/bin/snowflake-client"
-    echo "  Real path: $(readlink -f /usr/bin/snowflake-client)"
+# 5. Тестируем
+echo "4. Testing snowflake-client..."
+if [ -n "$SNOW_PATH" ] && [ -x "$SNOW_PATH" ]; then
+    # Пробуем получить версию
+    echo "Testing binary..."
+    if "$SNOW_PATH" --version 2>&1 | head -1; then
+        echo "✓ Binary works!"
+    elif "$SNOW_PATH" -h 2>&1 | head -1; then
+        echo "✓ Binary responds to -h"
+    else
+        echo "✓ Binary exists and is executable"
+    fi
+    
+    # Создаем маркерный файл для LuCI
+    echo "installed: $(date)" > /tmp/snowflake_status
+    echo "path: $SNOW_PATH" >> /tmp/snowflake_status
+    echo "ram: true" >> /tmp/snowflake_status
+    
     echo ""
-    echo "Note: Snowflake is installed in RAM and will disappear after reboot."
-    echo "To install permanently, add to /etc/rc.local:"
-    echo "  /usr/bin/install-snowflake-ram"
+    echo "=== Installation successful! ==="
+    echo "Snowflake-client installed in RAM"
+    echo "Binary: $SNOW_PATH"
+    echo ""
+    echo "Note: Will not persist after reboot."
+    echo "For auto-install on boot, add to /etc/rc.local:"
+    echo "  sleep 15 && /usr/bin/install-snowflake-ram >/tmp/snowflake.log 2>&1 &"
+    
     exit 0
 else
-    echo "✗ Installation failed!"
+    echo "✗ snowflake-client is not executable"
     exit 1
 fi
 EOF
@@ -883,7 +1044,7 @@ start() {
     if [ -f /etc/tor/torrc ] && grep -q "webtunnel" /etc/tor/torrc; then
         if [ ! -f /usr/bin/snowflake-client ]; then
             logger -t snowflake "Installing snowflake to RAM..."
-            /usr/bin/install-snowflake-ram
+            /usr/bin/install-snowflake-ram >/tmp/snowflake_install.log 2>&1 &
         fi
     fi
 }
@@ -891,7 +1052,7 @@ start() {
 stop() {
     # Cleanup on stop
     umount /tmp/snowflake_ram 2>/dev/null
-    rm -rf /tmp/snowflake_ram
+    rm -rf /tmp/snowflake_ram 2>/dev/null
 }
 EOF
 
