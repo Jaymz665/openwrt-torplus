@@ -1,66 +1,69 @@
 #!/bin/sh
 
-# PeDitXOS Tools - TORPlus Installer v31.0 (Fixed for Services Menu)
-# Fixed mkdir, menu location, and dependencies
+# PeDitXOS Tools - TORPlus Installer (Webtunnel Edition)
 
 echo ">>> Starting TORPlus installation..."
-LOG_FILE="/tmp/peditxos_torplus_log.txt"
+LOG_FILE="/tmp/torplus_install.log"
 DEBUG_LOG_FILE="/tmp/torplus_debug.log"
-
-# Function to show progress for long tasks
-run_with_heartbeat() {
-    COMMAND_TO_RUN="$1"
-    ( eval "$COMMAND_TO_RUN" ) &
-    CMD_PID=$!
-    while kill -0 $CMD_PID >/dev/null 2>&1; do
-        echo -n "."
-        sleep 3
-    done
-    wait $CMD_PID
-    return $?
-}
 
 # --- Main TORPlus installation function ---
 install_torplus() {
     echo "Installing required packages..."
-    run_with_heartbeat "opkg update"
-    echo "Installing core packages..."
-    opkg install obfs4proxy tor ca-certificates curl coreutils-base64
+    opkg update
+    
+    echo "Installing Tor and dependencies..."
+    opkg install tor ca-certificates curl coreutils-base64
+    
+    echo "Installing Snowflake (includes webtunnel support)..."
+    # Пробуем установить snowflake (лучший вариант для webtunnel)
+    if opkg list | grep -q snowflake; then
+        opkg install snowflake-proxy
+        WEBTUNNEL_CLIENT="/usr/bin/snowflake-client"
+    else
+        echo "Snowflake not in repository. Installing obfs4proxy as fallback..."
+        opkg install obfs4proxy
+        WEBTUNNEL_CLIENT="/usr/bin/obfs4proxy"
+    fi
+    
     echo "Installing LuCI dependencies..."
     opkg install luci-base luci-compat luci-lib-ipkg luci-lib-nixio
     
     echo "Creating TORPlus LuCI UI..."
 
-    # Ensure the directory exists before writing the file
+    # Ensure the directory exists
     mkdir -p /usr/lib/lua/luci/view/torplus
     
-    # Check and create the UCI config file if it doesn't exist
+    # Create UCI config
     if [ ! -f /etc/config/torplus ]; then
         echo "Creating UCI configuration for torplus..."
         cat > /etc/config/torplus << 'EOF'
 config settings 'settings'
-    option bridge_type 'obfs4'
+    option bridge_type 'webtunnel'
+    option custom_bridges ''
+    option use_custom '1'
 EOF
     fi
     
     # Ensure settings exist
-    uci -q get torplus.settings >/dev/null 2>&1 || uci set torplus.settings=torplus
-    uci -q set torplus.settings.bridge_type='obfs4'
-    uci -q commit torplus
+    if ! uci -q get torplus.settings >/dev/null 2>&1; then
+        uci set torplus.settings=torplus
+        uci set torplus.settings.bridge_type='webtunnel'
+        uci set torplus.settings.custom_bridges=''
+        uci set torplus.settings.use_custom='1'
+        uci commit torplus
+    fi
 
-    # Write the LuCI controller file - РАЗМЕЩАЕМ В РАЗДЕЛЕ SERVICES!
+    # Write the LuCI controller file
     mkdir -p /usr/lib/lua/luci/controller
     cat > /usr/lib/lua/luci/controller/torplus.lua <<'EoL'
 module("luci.controller.torplus", package.seeall)
 
 function index()
-    -- Проверяем наличие конфигурации
     local fs = require "nixio.fs"
     if not fs.access("/etc/config/torplus") then
         return
     end
     
-    -- Размещаем в разделе Services (Сервисы)
     entry({"admin", "services", "torplus"}, template("torplus/main"), _("TORPlus"), 92)
     entry({"admin", "services", "torplus_api"}, call("api_handler")).leaf = true
 end
@@ -69,13 +72,16 @@ function api_handler()
     local http = require("luci.http")
     local sys = require("luci.sys")
     local uci = require("luci.model.uci").cursor()
+    local nixio = require("nixio")
     local action = http.formvalue("action")
     local DEBUG_LOG_FILE = "/tmp/torplus_debug.log"
 
     if action == "status" then
         local running = sys.call("pgrep -f '/usr/sbin/tor' >/dev/null 2>&1") == 0
         local ip = "N/A"
-        local bridge = uci:get("torplus", "settings", "bridge_type") or "obfs4"
+        local bridge = uci:get("torplus", "settings", "bridge_type") or "webtunnel"
+        local use_custom = uci:get("torplus", "settings", "use_custom") or "1"
+        local custom_bridges = uci:get("torplus", "settings", "custom_bridges") or ""
         
         if running then
             for i = 1, 3 do
@@ -89,7 +95,13 @@ function api_handler()
         end
 
         http.prepare_content("application/json")
-        http.write_json({running = running, ip = ip, bridge = bridge})
+        http.write_json({
+            running = running, 
+            ip = ip, 
+            bridge = bridge,
+            use_custom = use_custom,
+            custom_bridges = custom_bridges
+        })
         
     elseif action == "toggle" then
         local running = sys.call("pgrep -f '/usr/sbin/tor' >/dev/null 2>&1") == 0
@@ -103,24 +115,89 @@ function api_handler()
         http.write_json({success = true})
         
     elseif action == "save_bridge" then
-        local bridge_type = http.formvalue("bridge_type") or "obfs4"
+        local bridge_type = http.formvalue("bridge_type") or "webtunnel"
+        local custom_bridges = http.formvalue("custom_bridges") or ""
+        local use_custom = http.formvalue("use_custom") or "1"
         
         sys.call("echo '--- Debug Log Started: $(date) ---' > " .. DEBUG_LOG_FILE)
         sys.call("echo 'Action: save_bridge, Bridge Type: " .. bridge_type .. "' >> " .. DEBUG_LOG_FILE)
         
+        -- Сохраняем настройки
         uci:set("torplus", "settings", "bridge_type", bridge_type)
+        uci:set("torplus", "settings", "custom_bridges", custom_bridges)
+        uci:set("torplus", "settings", "use_custom", use_custom)
         uci:commit("torplus")
-        sys.call("echo 'UCI setting saved.' >> " .. DEBUG_LOG_FILE)
+        
+        sys.call("echo 'UCI settings saved.' >> " .. DEBUG_LOG_FILE)
 
+        -- Строим конфиг torrc с поддержкой webtunnel
         local torrc_content = "SocksPort 9050\n"
-        if bridge_type == "obfs4" then
-            torrc_content = torrc_content .. "UseBridges 1\nClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\nBridge obfs4 192.0.2.2:2 cert=ABC iat-mode=0"
-        elseif bridge_type == "meek" then
-            torrc_content = torrc_content .. "UseBridges 1\nClientTransportPlugin meek exec /usr/bin/meek-client\nBridge meek 192.0.2.3:3 url=https://ajax.aspnetcdn.com/ delay=1000"
+        
+        if use_custom == "1" and custom_bridges ~= "" then
+            -- Используем кастомные мосты (в основном webtunnel)
+            torrc_content = torrc_content .. "UseBridges 1\n"
+            
+            -- Проверяем наличие snowflake для webtunnel
+            local has_snowflake = nixio.fs.access("/usr/bin/snowflake-client")
+            local has_obfs4 = nixio.fs.access("/usr/bin/obfs4proxy")
+            
+            -- Определяем, какие типы мостов есть
+            local has_webtunnel = false
+            local has_obfs4_bridge = false
+            
+            for bridge_line in custom_bridges:gmatch("[^\r\n]+") do
+                local clean_line = bridge_line:gsub("^%s*(.-)%s*$", "%1")
+                if clean_line ~= "" and not clean_line:match("^#") then
+                    if clean_line:match("^%s*webtunnel") then
+                        has_webtunnel = true
+                    elseif clean_line:match("^%s*obfs4") then
+                        has_obfs4_bridge = true
+                    end
+                end
+            end
+            
+            -- Добавляем нужные плагины
+            if has_webtunnel and has_snowflake then
+                torrc_content = torrc_content .. "ClientTransportPlugin webtunnel exec /usr/bin/snowflake-client\n"
+            elseif has_webtunnel then
+                torrc_content = torrc_content .. "# WARNING: snowflake-client not found for webtunnel support\n"
+                torrc_content = torrc_content .. "# Install snowflake-proxy package\n"
+            end
+            
+            if has_obfs4_bridge and has_obfs4 then
+                torrc_content = torrc_content .. "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n"
+            end
+            
+            -- Добавляем сами мосты
+            for bridge_line in custom_bridges:gmatch("[^\r\n]+") do
+                local clean_line = bridge_line:gsub("^%s*(.-)%s*$", "%1")
+                if clean_line ~= "" and not clean_line:match("^#") then
+                    torrc_content = torrc_content .. "Bridge " .. clean_line .. "\n"
+                end
+            end
+            
         else
-            torrc_content = torrc_content .. "UseBridges 0"
+            -- Стандартные настройки (без фиктивных мостов)
+            if bridge_type == "webtunnel" then
+                torrc_content = torrc_content .. "UseBridges 1\n"
+                if nixio.fs.access("/usr/bin/snowflake-client") then
+                    torrc_content = torrc_content .. "ClientTransportPlugin webtunnel exec /usr/bin/snowflake-client\n"
+                else
+                    torrc_content = torrc_content .. "# Install snowflake-proxy for webtunnel support\n"
+                end
+                torrc_content = torrc_content .. "# Add webtunnel bridges in custom section\n"
+            elseif bridge_type == "obfs4" then
+                torrc_content = torrc_content .. "UseBridges 1\n"
+                if nixio.fs.access("/usr/bin/obfs4proxy") then
+                    torrc_content = torrc_content .. "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n"
+                end
+                torrc_content = torrc_content .. "# Add obfs4 bridges in custom section\n"
+            else
+                torrc_content = torrc_content .. "UseBridges 0\n"
+            end
         end
 
+        -- Пишем конфиг
         local f = io.open("/etc/tor/torrc", "w")
         if f then
             f:write(torrc_content)
@@ -147,12 +224,12 @@ function api_handler()
 end
 EoL
     
-    # Write the LuCI view file (integrated HTML and JavaScript)
+    # Write the LuCI view file с акцентом на webtunnel
     cat > /usr/lib/lua/luci/view/torplus/main.htm <<'EoL'
 <%+header%>
 <style>
 .torplus-container{
-    max-width: 600px;
+    max-width: 700px;
     margin: 40px auto;
     padding: 24px;
     background-color: rgba(30, 30, 30, 0.9);
@@ -181,10 +258,12 @@ h2{
 .torplus-label{
     font-weight: 600;
     color: #ccc;
+    min-width: 180px;
 }
 .torplus-value{
     font-weight: 700;
     color: #fff;
+    flex-grow: 1;
 }
 .torplus-status-indicator{
     display: inline-block;
@@ -246,13 +325,12 @@ h2{
     color: #ccc;
     margin-bottom: 8px;
 }
-.bridge-btn-group{
+.bridge-type-selector{
     display: flex;
     gap: 10px;
-    margin-top: 10px;
-    justify-content: center;
+    margin-bottom: 20px;
 }
-.bridge-btn {
+.bridge-type-btn {
     padding: 10px 15px;
     background-color: rgba(255, 255, 255, 0.1);
     border: 1px solid rgba(255, 255, 255, 0.2);
@@ -261,20 +339,72 @@ h2{
     cursor: pointer;
     font-weight: 600;
     transition: all 0.2s ease;
+    flex: 1;
+    text-align: center;
 }
-.bridge-btn:hover {
+.bridge-type-btn:hover {
     background-color: rgba(255, 255, 255, 0.2);
 }
-.bridge-btn.selected-bridge {
+.bridge-type-btn.selected {
     background-color: #007bff;
     border-color: #007bff;
     color: #fff;
     transform: scale(1.05);
 }
-.bridge-btn.disabled {
-    cursor: not-allowed;
-    background-color: rgba(255, 255, 255, 0.05);
-    color: #999;
+.custom-bridges-section {
+    margin-top: 20px;
+    padding: 15px;
+    background-color: rgba(0, 0, 0, 0.2);
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+.bridge-info {
+    background: rgba(0, 123, 255, 0.1);
+    border-left: 4px solid #007bff;
+    padding: 10px;
+    margin-bottom: 15px;
+    border-radius: 4px;
+}
+.custom-bridges-textarea {
+    width: 100%;
+    min-height: 150px;
+    background-color: rgba(0, 0, 0, 0.5);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 6px;
+    color: #fff;
+    padding: 10px;
+    font-family: monospace;
+    font-size: 12px;
+    resize: vertical;
+}
+.bridge-examples {
+    margin-top: 10px;
+    font-size: 11px;
+    color: #aaa;
+    font-family: monospace;
+}
+.bridge-examples code {
+    display: block;
+    background: rgba(0, 0, 0, 0.3);
+    padding: 5px;
+    border-radius: 3px;
+    margin: 5px 0;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+.save-bridge-btn {
+    margin-top: 15px;
+    padding: 10px 20px;
+    background-color: #28a745;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-weight: bold;
+    width: 100%;
+}
+.save-bridge-btn:hover {
+    background-color: #218838;
 }
 .debug-log-container {
     margin-top: 30px;
@@ -301,7 +431,7 @@ h2{
 </style>
 
 <div class="torplus-container">
-    <h2>TORPlus Manager</h2>
+    <h2>TORPlus Manager (Webtunnel Edition)</h2>
 
     <div class="torplus-row">
         <span class="torplus-label">Service Status:</span>
@@ -314,23 +444,48 @@ h2{
         <span class="torplus-label">Outgoing IP:</span>
         <span id="ipText" class="torplus-value">...</span>
     </div>
+    <div class="torplus-row">
+        <span class="torplus-label">Bridge Mode:</span>
+        <span id="bridgeModeText" class="torplus-value">...</span>
+    </div>
     
     <div class="torplus-btn-group">
-        <button id="connectBtn" class="torplus-btn btn-connect">Connect</button>
-        <button id="disconnectBtn" class="torplus-btn btn-disconnect" style="display:none;">Disconnect</button>
+        <button id="connectBtn" class="torplus-btn btn-connect">Start Tor</button>
+        <button id="disconnectBtn" class="torplus-btn btn-disconnect" style="display:none;">Stop Tor</button>
     </div>
 
     <div class="bridge-settings">
-        <div class="torplus-row">
-            <span class="torplus-label">Active Bridge Type:</span>
-            <span id="activeBridgeText" class="torplus-value">...</span>
+        <h3>Bridge Configuration</h3>
+        
+        <div class="bridge-info">
+            <strong>Webtunnel Recommended:</strong> Webtunnel bridges work better in restrictive networks.
+            Get bridges from: <a href="https://bridges.torproject.org/" target="_blank" style="color: #4dabf7;">bridges.torproject.org</a>
         </div>
-        <label>Change Bridge Type:</label>
-        <div class="bridge-btn-group">
-            <button class="bridge-btn" data-bridge-type="obfs4">obfs4</button>
-            <button class="bridge-btn" data-bridge-type="meek">Meek</button>
-            <button class="bridge-btn" data-bridge-type="none">None</button>
+        
+        <div class="bridge-type-selector">
+            <button class="bridge-type-btn" data-bridge-type="webtunnel">Webtunnel</button>
+            <button class="bridge-type-btn" data-bridge-type="obfs4">obfs4</button>
+            <button class="bridge-type-btn" data-bridge-type="none">No Bridges</button>
         </div>
+        
+        <div class="custom-bridges-section">
+            <label>Custom Bridges (one per line):</label>
+            <textarea id="customBridgesText" class="custom-bridges-textarea" 
+                      placeholder="Paste your webtunnel bridges here...&#10;&#10;Example webtunnel bridges:&#10;webtunnel [2001:db8:adeb:7e0f:5140:7cd5:28b1:4503]:443 32F772D0970C2849B2B5BF9F0EC9D3F878DAEA43 url=https://files.bitrot.cz/Bho2k74VTFX6Bwr2XJG5V8gLhZEKgRQ5 ver=0.0.3&#10;webtunnel [2001:db8:57e6:c973:b296:4682:8c10:c049]:443 CA189269FB80216A1967ED19723B6D7639996663 url=https://goforwardbro.info/de1af89c3be2d3bbccc6cb34091f961f48caca14 ver=0.0.3"></textarea>
+            
+            <div class="bridge-examples">
+                <strong>Supported Bridge Types:</strong>
+                <code>webtunnel [IP]:port FINGERPRINT url=URL ver=VERSION</code>
+                <code>obfs4 IP:port FINGERPRINT cert=CERT iat-mode=MODE</code>
+                <code>meek IP:port url=URL front=DOMAIN</code>
+                
+                <div style="margin-top: 10px; color: #4dabf7;">
+                    <i class="icon-info"></i> Webtunnel requires snowflake-proxy package
+                </div>
+            </div>
+        </div>
+        
+        <button id="saveBridgeBtn" class="save-bridge-btn">Save & Apply Bridge Settings</button>
     </div>
 
     <div class="debug-log-container">
@@ -346,27 +501,42 @@ h2{
     const statusText = document.getElementById('statusText');
     const statusIndicator = document.getElementById('statusIndicator');
     const ipText = document.getElementById('ipText');
-    const activeBridgeText = document.getElementById('activeBridgeText');
-    const logOutput = document.getElementById('log-output');
-    const bridgeButtons = document.querySelectorAll('.bridge-btn-group .bridge-btn');
+    const bridgeModeText = document.getElementById('bridgeModeText');
+    const customBridgesText = document.getElementById('customBridgesText');
+    const saveBridgeBtn = document.getElementById('saveBridgeBtn');
+    const bridgeTypeButtons = document.querySelectorAll('.bridge-type-btn');
+    
+    let currentSettings = {
+        bridge: 'webtunnel',
+        use_custom: '1',
+        custom_bridges: ''
+    };
     
     let isApplying = false;
 
-    function resetBridgeButtons() {
-        bridgeButtons.forEach(btn => {
-            btn.classList.remove('selected-bridge', 'disabled');
-            btn.innerText = btn.dataset.bridgeType.charAt(0).toUpperCase() + btn.dataset.bridgeType.slice(1);
-        });
-    }
-
-    function setBridgeUIState(bridgeType) {
-        activeBridgeText.innerText = bridgeType;
-        resetBridgeButtons();
-        bridgeButtons.forEach(btn => {
-            if (btn.dataset.bridgeType === bridgeType) {
-                btn.classList.add('selected-bridge');
+    function updateUIFromSettings() {
+        bridgeModeText.innerText = currentSettings.bridge === 'none' ? 'Direct Connection' : 
+                                  currentSettings.use_custom === '1' ? 'Custom Bridges' : 'Standard Bridges';
+        
+        // Обновляем кнопки типа моста
+        bridgeTypeButtons.forEach(btn => {
+            btn.classList.remove('selected');
+            if (btn.dataset.bridgeType === currentSettings.bridge) {
+                btn.classList.add('selected');
             }
         });
+        
+        // Обновляем текстовое поле
+        customBridgesText.value = currentSettings.custom_bridges || '';
+        
+        // Если выбран "none", деактивируем текстовое поле
+        if (currentSettings.bridge === 'none') {
+            customBridgesText.disabled = true;
+            customBridgesText.placeholder = 'Bridges disabled (direct connection)';
+        } else {
+            customBridgesText.disabled = false;
+            customBridgesText.placeholder = 'Paste your bridges here...';
+        }
     }
 
     function updateConnectionUI(running, ip) {
@@ -379,9 +549,9 @@ h2{
 
         if (!isApplying) {
             connectBtn.classList.remove('disabled');
-            connectBtn.innerText = 'Connect';
+            connectBtn.innerText = 'Start Tor';
             disconnectBtn.classList.remove('disabled');
-            disconnectBtn.innerText = 'Disconnect';
+            disconnectBtn.innerText = 'Stop Tor';
         }
     }
 
@@ -389,10 +559,10 @@ h2{
         isApplying = true;
         if (connectBtn.style.display !== 'none') {
             connectBtn.classList.add('disabled');
-            connectBtn.innerText = 'Connecting...';
+            connectBtn.innerText = 'Starting...';
         } else {
             disconnectBtn.classList.add('disabled');
-            disconnectBtn.innerText = 'Disconnecting...';
+            disconnectBtn.innerText = 'Stopping...';
         }
         
         XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=toggle', null, function(x, data) {
@@ -400,20 +570,54 @@ h2{
         });
     }
 
-    function applyBridge(bridgeType) {
-        setBridgeUIState(bridgeType);
-        bridgeButtons.forEach(btn => btn.classList.add('disabled'));
-
-        XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=save_bridge&bridge_type=' + bridgeType, null, function(x, data) {
+    function saveBridgeSettings() {
+        const selectedBtn = document.querySelector('.bridge-type-btn.selected');
+        const bridgeType = selectedBtn ? selectedBtn.dataset.bridgeType : 'webtunnel';
+        const customBridges = customBridgesText.value.trim();
+        
+        // Валидация
+        if (bridgeType !== 'none' && customBridges === '') {
+            alert('Please enter bridges or select "No Bridges"');
+            return;
+        }
+        
+        saveBridgeBtn.classList.add('disabled');
+        saveBridgeBtn.innerText = 'Applying...';
+        
+        const params = new URLSearchParams({
+            action: 'save_bridge',
+            bridge_type: bridgeType,
+            use_custom: '1',
+            custom_bridges: bridgeType === 'none' ? '' : customBridges
+        });
+        
+        XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?' + params.toString(), null, function(x, data) {
+            saveBridgeBtn.classList.remove('disabled');
+            saveBridgeBtn.innerText = 'Save & Apply Bridge Settings';
+            
             if (data && data.success) {
-                alert('Bridge settings applied. Tor service is restarting...');
+                alert('Settings applied! Tor is restarting...');
+                setTimeout(loadStatus, 3000);
             } else {
-                alert('Failed to apply bridge settings.');
+                alert('Failed to apply settings.');
             }
-            bridgeButtons.forEach(btn => btn.classList.remove('disabled'));
         });
     }
 
+    function loadStatus() {
+        XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=status', null, function(x, st) {
+            if (!st) return;
+            
+            currentSettings.bridge = st.bridge || 'webtunnel';
+            currentSettings.use_custom = st.use_custom || '1';
+            currentSettings.custom_bridges = st.custom_bridges || '';
+            
+            updateUIFromSettings();
+            updateConnectionUI(st.running, st.ip);
+        });
+    }
+
+    // Event Listeners
     connectBtn.addEventListener('click', function() {
         if (!connectBtn.classList.contains('disabled')) {
             toggleService();
@@ -426,42 +630,53 @@ h2{
         }
     });
     
-    bridgeButtons.forEach(btn => {
+    bridgeTypeButtons.forEach(btn => {
         btn.addEventListener('click', function() {
-            const bridgeType = this.dataset.bridgeType;
-            if (this.classList.contains('selected-bridge') || this.classList.contains('disabled')) {
-                return;
+            bridgeTypeButtons.forEach(b => b.classList.remove('selected'));
+            this.classList.add('selected');
+            
+            // Обновляем placeholder в зависимости от типа
+            const type = this.dataset.bridgeType;
+            if (type === 'webtunnel') {
+                customBridgesText.placeholder = 'Paste webtunnel bridges...';
+            } else if (type === 'obfs4') {
+                customBridgesText.placeholder = 'Paste obfs4 bridges...';
+            } else if (type === 'none') {
+                customBridgesText.placeholder = 'Bridges disabled (direct connection)';
+                customBridgesText.value = '';
             }
-            applyBridge(bridgeType);
         });
     });
+    
+    saveBridgeBtn.addEventListener('click', saveBridgeSettings);
 
     // Initial load
-    XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=status', null, function(x, st) {
-        if (!st) return;
-        setBridgeUIState(st.bridge || 'obfs4');
-        updateConnectionUI(st.running, st.ip);
-    });
+    loadStatus();
     
-    // Initial log load
+    // Load debug log
     XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=get_debug_log', null, function(x, data) {
         if (data && data.log) {
-            logOutput.textContent = data.log;
+            document.getElementById('log-output').textContent = data.log;
         }
     });
 
     // Background polling
     XHR.poll(5, '<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=status', null, function(x, st) {
         if (st) {
+            currentSettings.bridge = st.bridge || 'webtunnel';
+            currentSettings.use_custom = st.use_custom || '1';
+            currentSettings.custom_bridges = st.custom_bridges || '';
+            
+            updateUIFromSettings();
             updateConnectionUI(st.running, st.ip);
         }
     });
 
     XHR.poll(2, '<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=get_debug_log', null, function(x, data) {
         if (data && data.log) {
+            const logOutput = document.getElementById('log-output');
             logOutput.textContent = data.log;
-            const isScrolledToBottom = logOutput.scrollHeight - logOutput.clientHeight <= logOutput.scrollTop + 20;
-            if(isScrolledToBottom) {
+            if(logOutput.scrollHeight - logOutput.clientHeight <= logOutput.scrollTop + 20) {
                 logOutput.scrollTop = logOutput.scrollHeight;
             }
         }
@@ -471,100 +686,68 @@ h2{
 <%+footer%>
 EoL
 
-    # Remove old LuCI files to prevent conflicts
+    # Clean up old files
     rm -f /usr/lib/lua/luci/model/cbi/torplus_manager.lua 2>/dev/null
     rm -f /usr/lib/lua/luci/view/torplus_status_section.htm 2>/dev/null
     
-    # Create and clear the debug log file
-    echo "TORPlus installation started at $(date)" > "$DEBUG_LOG_FILE"
+    # Create debug log
+    echo "TORPlus Webtunnel Edition installation started at $(date)" > "$DEBUG_LOG_FILE"
 
-    # Write the initial torrc file with obfs4 bridge as default
+    # Write initial torrc with webtunnel focus
     cat > /etc/tor/torrc << 'EOF'
 SocksPort 9050
 UseBridges 1
-ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy
-Bridge obfs4 192.0.2.2:2 cert=ABC iat-mode=0
+
+# Webtunnel configuration (requires snowflake-proxy)
+# ClientTransportPlugin webtunnel exec /usr/bin/snowflake-client
+
+# Add your webtunnel bridges below (one per line):
+# webtunnel [IP]:port FINGERPRINT url=URL ver=VERSION
+
+# Example:
+# webtunnel [2001:db8:adeb:7e0f:5140:7cd5:28b1:4503]:443 32F772D0970C2849B2B5BF9F0EC9D3F878DAEA43 url=https://files.bitrot.cz/Bho2k74VTFX6Bwr2XJG5V8gLhZEKgRQ5 ver=0.0.3
 EOF
     
-    # Enable and start the Tor service
+    # Enable and start Tor
     /etc/init.d/tor enable
     /etc/init.d/tor restart
     
-    # Configure Passwall or Passwall2 with detailed settings
-    if uci show passwall2 >/dev/null 2>&1; then
-        echo "Configuring Passwall2..."
-        uci set passwall2.TorNode=nodes
-        uci set passwall2.TorNode.remarks='Tor'
-        uci set passwall2.TorNode.type='Xray'
-        uci set passwall2.TorNode.protocol='socks'
-        uci set passwall2.TorNode.server='127.0.0.1'
-        uci set passwall2.TorNode.port='9050'
-        uci set passwall2.TorNode.address='127.0.0.1'
-        uci set passwall2.TorNode.tls='0'
-        uci set passwall2.TorNode.transport='tcp'
-        uci set passwall2.TorNode.tcp_guise='none'
-        uci set passwall2.TorNode.tcpMptcp='0'
-        uci set passwall2.TorNode.tcpNoDelay='0'
-        uci commit passwall2
-        echo "Passwall2 configured with TOR node."
-    elif uci show passwall >/dev/null 2>&1; then
-        echo "Configuring Passwall..."
-        uci set passwall.TorNode=nodes
-        uci set passwall.TorNode.remarks='Tor'
-        uci set passwall.TorNode.type='Xray'
-        uci set passwall.TorNode.protocol='socks'
-        uci set passwall.TorNode.server='127.0.0.1'
-        uci set passwall.TorNode.port='9050'
-        uci set passwall.TorNode.address='127.0.0.1'
-        uci set passwall.TorNode.tls='0'
-        uci set passwall.TorNode.transport='tcp'
-        uci set passwall.TorNode.tcp_guise='none'
-        uci set passwall.TorNode.tcpMptcp='0'
-        uci set passwall.TorNode.tcpNoDelay='0'
-        uci commit passwall
-        echo "Passwall configured with TOR node."
-    fi
-    
-    echo "TORPlus installation completed successfully."
+    echo "TORPlus Webtunnel Edition installation completed."
 }
 
-# Run the installation function
+# Run installation
 install_torplus
 
-# Clear LuCI cache and restart uhttpd to display the new page
+# Clear cache and restart uhttpd
 echo "Reloading LuCI UI..."
 rm -rf /tmp/luci-* 2>/dev/null
 rm -f /var/run/luci-indexcache 2>/dev/null
-rm -f /www/luci-static/resources/cbi.js 2>/dev/null
 
-# Restart uhttpd
 if [ -f /etc/init.d/uhttpd ]; then
     /etc/init.d/uhttpd restart 2>/dev/null || /etc/init.d/uhttpd reload 2>/dev/null
 fi
 
-echo "Operation completed successfully."
-
-# Use cat heredoc for robust multi-line output
 cat << "EOM"
 
 ================================================
- ______      _____   _      _    _     _____       
- (_____ \    (____ \ (_)_   \ \  / /   / ___ \      
- _____) )___ _   \ \ _| |_  \ \/ /   | |   | | ___ 
- |  ____/ _  ) |   | | |  _)  )  (    | |   | |/___)
- | |   ( (/ /| |__/ /| | |__ / /\ \   | |___| |___ |
- |_|    \____)_____/ |_|\___)_/  \_\   \_____/(___/ 
-                                                    
-                                       TORPlus by PeDitX
+TORPlus Webtunnel Edition Installed!
 
-Installation Complete!
-TORPlus is now available in LuCI web interface:
+Key Features:
+✓ Webtunnel bridge support (primary)
+✓ Snowflake client integration
+✓ Custom bridge configuration
+✓ No fake/placeholder bridges
 
-1. Open: http://$(uci get network.lan.ipaddr 2>/dev/null || echo '192.168.1.1')
-2. Go to: Services → TORPlus
+Important:
+1. For webtunnel support, install snowflake-proxy:
+   opkg install snowflake-proxy
+   
+2. Get webtunnel bridges from:
+   https://bridges.torproject.org/
 
-Direct link: http://$(uci get network.lan.ipaddr 2>/dev/null || echo '192.168.1.1')/cgi-bin/luci/admin/services/torplus
+3. Add bridges in the interface and click "Save & Apply"
 
-SOCKS5 Proxy: 127.0.0.1:9050
+Access: Services → TORPlus in LuCI
+SOCKS5: 127.0.0.1:9050
 ================================================
 EOM
