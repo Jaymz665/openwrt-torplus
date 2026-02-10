@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# PeDitXOS Tools - TORPlus Installer v32.0 (Custom Bridges Support)
+# PeDitXOS Tools - TORPlus Installer v35.0 (Webtunnel Support)
 
 echo ">>> Starting TORPlus installation..."
 LOG_FILE="/tmp/peditxos_torplus_log.txt"
@@ -24,9 +24,9 @@ install_torplus() {
     echo "Installing required packages..."
     run_with_heartbeat "opkg update"
     echo "Installing core packages..."
-    opkg install obfs4proxy tor ca-certificates curl coreutils-base64
+    opkg install tor obfs4proxy curl ca-certificates
     echo "Installing LuCI dependencies..."
-    opkg install luci-base luci-compat luci-lib-ipkg luci-lib-nixio
+    opkg install luci-base luci-compat luci-lib-ipkg
     
     echo "Creating TORPlus LuCI UI..."
 
@@ -38,34 +38,32 @@ install_torplus() {
         echo "Creating UCI configuration for torplus..."
         cat > /etc/config/torplus << 'EOF'
 config settings 'settings'
-    option bridge_type 'obfs4'
+    option bridge_type 'custom'
     option custom_bridges ''
-    option use_custom '0'
+    option use_custom '1'
 EOF
     fi
     
     # Ensure settings exist
     if ! uci -q get torplus.settings >/dev/null 2>&1; then
         uci set torplus.settings=torplus
-        uci set torplus.settings.bridge_type='obfs4'
+        uci set torplus.settings.bridge_type='custom'
         uci set torplus.settings.custom_bridges=''
-        uci set torplus.settings.use_custom='0'
+        uci set torplus.settings.use_custom='1'
         uci commit torplus
     fi
 
-    # Write the LuCI controller file
+    # Write the LuCI controller file with webtunnel support
     mkdir -p /usr/lib/lua/luci/controller
     cat > /usr/lib/lua/luci/controller/torplus.lua <<'EoL'
 module("luci.controller.torplus", package.seeall)
 
 function index()
-    -- Проверяем наличие конфигурации
     local fs = require "nixio.fs"
     if not fs.access("/etc/config/torplus") then
         return
     end
     
-    -- Размещаем в разделе Services (Сервисы)
     entry({"admin", "services", "torplus"}, template("torplus/main"), _("TORPlus"), 92)
     entry({"admin", "services", "torplus_api"}, call("api_handler")).leaf = true
 end
@@ -74,14 +72,15 @@ function api_handler()
     local http = require("luci.http")
     local sys = require("luci.sys")
     local uci = require("luci.model.uci").cursor()
+    local nixio = require("nixio")
     local action = http.formvalue("action")
     local DEBUG_LOG_FILE = "/tmp/torplus_debug.log"
 
     if action == "status" then
         local running = sys.call("pgrep -f '/usr/sbin/tor' >/dev/null 2>&1") == 0
         local ip = "N/A"
-        local bridge = uci:get("torplus", "settings", "bridge_type") or "obfs4"
-        local use_custom = uci:get("torplus", "settings", "use_custom") or "0"
+        local bridge = uci:get("torplus", "settings", "bridge_type") or "custom"
+        local use_custom = uci:get("torplus", "settings", "use_custom") or "1"
         local custom_bridges = uci:get("torplus", "settings", "custom_bridges") or ""
         
         if running then
@@ -116,9 +115,9 @@ function api_handler()
         http.write_json({success = true})
         
     elseif action == "save_bridge" then
-        local bridge_type = http.formvalue("bridge_type") or "obfs4"
+        local bridge_type = http.formvalue("bridge_type") or "custom"
         local custom_bridges = http.formvalue("custom_bridges") or ""
-        local use_custom = http.formvalue("use_custom") or "0"
+        local use_custom = http.formvalue("use_custom") or "1"
         
         sys.call("echo '--- Debug Log Started: $(date) ---' > " .. DEBUG_LOG_FILE)
         sys.call("echo 'Action: save_bridge, Bridge Type: " .. bridge_type .. "' >> " .. DEBUG_LOG_FILE)
@@ -132,34 +131,65 @@ function api_handler()
         
         sys.call("echo 'UCI settings saved.' >> " .. DEBUG_LOG_FILE)
 
-        -- Строим конфиг torrc
+        -- Строим конфиг torrc с поддержкой webtunnel
         local torrc_content = "SocksPort 9050\n"
+        local plugins_added = {}
         
         if use_custom == "1" and custom_bridges ~= "" then
             -- Используем кастомные мосты
             torrc_content = torrc_content .. "UseBridges 1\n"
-            -- Разбиваем мосты по строкам
+            
+            -- Сначала проходим по всем мостам чтобы определить нужные плагины
             for bridge_line in custom_bridges:gmatch("[^\r\n]+") do
-                if bridge_line:match("^%s*obfs4") then
-                    torrc_content = torrc_content .. "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n"
-                elseif bridge_line:match("^%s*meek") then
-                    torrc_content = torrc_content .. "ClientTransportPlugin meek exec /usr/bin/meek-client\n"
+                local clean_line = bridge_line:gsub("^%s*(.-)%s*$", "%1")
+                if clean_line ~= "" and not clean_line:match("^#") then
+                    if clean_line:match("^%s*obfs4") then
+                        plugins_added["obfs4"] = true
+                    elseif clean_line:match("^%s*webtunnel") then
+                        plugins_added["webtunnel"] = true
+                    elseif clean_line:match("^%s*meek") then
+                        plugins_added["meek"] = true
+                    end
                 end
-                torrc_content = torrc_content .. "Bridge " .. bridge_line:gsub("^%s*(.-)%s*$", "%1") .. "\n"
             end
+            
+            -- Добавляем плагины
+            if plugins_added["obfs4"] and nixio.fs.access("/usr/bin/obfs4proxy") then
+                torrc_content = torrc_content .. "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n"
+            end
+            
+            if plugins_added["webtunnel"] and nixio.fs.access("/usr/bin/snowflake-client") then
+                torrc_content = torrc_content .. "ClientTransportPlugin webtunnel exec /usr/bin/snowflake-client\n"
+            elseif plugins_added["webtunnel"] then
+                torrc_content = torrc_content .. "# WARNING: snowflake-client not found for webtunnel\n"
+                torrc_content = torrc_content .. "# Run: /usr/bin/install-snowflake-ram\n"
+            end
+            
+            if plugins_added["meek"] and nixio.fs.access("/usr/bin/meek-client") then
+                torrc_content = torrc_content .. "ClientTransportPlugin meek exec /usr/bin/meek-client\n"
+            end
+            
+            -- Добавляем мосты
+            for bridge_line in custom_bridges:gmatch("[^\r\n]+") do
+                local clean_line = bridge_line:gsub("^%s*(.-)%s*$", "%1")
+                if clean_line ~= "" and not clean_line:match("^#") then
+                    torrc_content = torrc_content .. "Bridge " .. clean_line .. "\n"
+                end
+            end
+            
         else
-            -- Используем стандартные мосты
+            -- Стандартные настройки (без фиктивных мостов)
             if bridge_type == "obfs4" then
-                torrc_content = torrc_content .. "UseBridges 1\nClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n"
-                torrc_content = torrc_content .. "Bridge obfs4 192.0.2.2:2 cert=ABC iat-mode=0\n"
-                torrc_content = torrc_content .. "# Add real bridges from: https://bridges.torproject.org/\n"
-                torrc_content = torrc_content .. "# Example: Bridge obfs4 1.2.3.4:1234 cert=ABCDEF iat-mode=0\n"
-            elseif bridge_type == "meek" then
-                torrc_content = torrc_content .. "UseBridges 1\nClientTransportPlugin meek exec /usr/bin/meek-client\n"
-                torrc_content = torrc_content .. "Bridge meek 192.0.2.3:3 url=https://ajax.aspnetcdn.com/ delay=1000\n"
-                torrc_content = torrc_content .. "# Add real meek bridges\n"
-            else
+                torrc_content = torrc_content .. "UseBridges 1\n"
+                if nixio.fs.access("/usr/bin/obfs4proxy") then
+                    torrc_content = torrc_content .. "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n"
+                end
+                torrc_content = torrc_content .. "# Add obfs4 bridges in custom section\n"
+            elseif bridge_type == "none" then
                 torrc_content = torrc_content .. "UseBridges 0\n"
+            else
+                torrc_content = torrc_content .. "UseBridges 1\n"
+                torrc_content = torrc_content .. "# Add bridges in custom section\n"
             end
         end
 
@@ -185,11 +215,16 @@ function api_handler()
         end
         http.prepare_content("application/json")
         http.write_json({log = content})
+        
+    elseif action == "check_snowflake" then
+        local has_snowflake = nixio.fs.access("/usr/bin/snowflake-client")
+        http.prepare_content("application/json")
+        http.write_json({installed = has_snowflake})
     end
 end
 EoL
     
-    # Write the LuCI view file с поддержкой кастомных мостов
+    # Write the LuCI view file с поддержкой webtunnel
     cat > /usr/lib/lua/luci/view/torplus/main.htm <<'EoL'
 <%+header%>
 <style>
@@ -290,14 +325,12 @@ h2{
     color: #ccc;
     margin-bottom: 8px;
 }
-.bridge-btn-group{
+.bridge-type-selector{
     display: flex;
     gap: 10px;
-    margin-top: 10px;
-    margin-bottom: 20px;
-    justify-content: center;
+    margin-bottom: 15px;
 }
-.bridge-btn {
+.bridge-type-btn {
     padding: 10px 15px;
     background-color: rgba(255, 255, 255, 0.1);
     border: 1px solid rgba(255, 255, 255, 0.2);
@@ -306,20 +339,49 @@ h2{
     cursor: pointer;
     font-weight: 600;
     transition: all 0.2s ease;
+    flex: 1;
+    text-align: center;
 }
-.bridge-btn:hover {
+.bridge-type-btn:hover {
     background-color: rgba(255, 255, 255, 0.2);
 }
-.bridge-btn.selected-bridge {
+.bridge-type-btn.selected {
     background-color: #007bff;
     border-color: #007bff;
     color: #fff;
     transform: scale(1.05);
 }
-.bridge-btn.disabled {
+.bridge-type-btn.disabled {
     cursor: not-allowed;
     background-color: rgba(255, 255, 255, 0.05);
     color: #999;
+}
+.snowflake-info {
+    background: rgba(0, 123, 255, 0.1);
+    border-left: 4px solid #007bff;
+    padding: 10px;
+    margin-bottom: 15px;
+    border-radius: 4px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.snowflake-info .status {
+    font-weight: bold;
+}
+.snowflake-info .status.installed {
+    color: #28a745;
+}
+.snowflake-info .status.not-installed {
+    color: #dc3545;
+}
+.snowflake-info button {
+    padding: 5px 10px;
+    background: #28a745;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
 }
 .custom-bridges-section {
     margin-top: 20px;
@@ -328,21 +390,9 @@ h2{
     border-radius: 8px;
     border: 1px solid rgba(255, 255, 255, 0.1);
 }
-.custom-toggle {
-    display: flex;
-    align-items: center;
-    margin-bottom: 15px;
-}
-.custom-toggle label {
-    margin-right: 10px;
-    cursor: pointer;
-}
-.custom-toggle input[type="checkbox"] {
-    margin-right: 8px;
-}
 .custom-bridges-textarea {
     width: 100%;
-    min-height: 120px;
+    min-height: 150px;
     background-color: rgba(0, 0, 0, 0.5);
     border: 1px solid rgba(255, 255, 255, 0.2);
     border-radius: 6px;
@@ -364,6 +414,8 @@ h2{
     padding: 5px;
     border-radius: 3px;
     margin: 5px 0;
+    white-space: pre-wrap;
+    word-break: break-all;
 }
 .save-bridge-btn {
     margin-top: 15px;
@@ -404,7 +456,7 @@ h2{
 </style>
 
 <div class="torplus-container">
-    <h2>TORPlus Manager</h2>
+    <h2>TORPlus Manager (Webtunnel Support)</h2>
 
     <div class="torplus-row">
         <span class="torplus-label">Service Status:</span>
@@ -419,50 +471,47 @@ h2{
     </div>
     <div class="torplus-row">
         <span class="torplus-label">Bridge Mode:</span>
-        <span id="bridgeModeText" class="torplus-value">...</span>
+        <span id="bridgeModeText" class="torplus-value">Custom Bridges</span>
     </div>
     
     <div class="torplus-btn-group">
-        <button id="connectBtn" class="torplus-btn btn-connect">Connect</button>
-        <button id="disconnectBtn" class="torplus-btn btn-disconnect" style="display:none;">Disconnect</button>
+        <button id="connectBtn" class="torplus-btn btn-connect">Start Tor</button>
+        <button id="disconnectBtn" class="torplus-btn btn-disconnect" style="display:none;">Stop Tor</button>
     </div>
 
     <div class="bridge-settings">
-        <div class="torplus-row">
-            <span class="torplus-label">Active Bridge Type:</span>
-            <span id="activeBridgeText" class="torplus-value">...</span>
+        <h3>Bridge Configuration</h3>
+        
+        <div id="snowflakeInfo" class="snowflake-info">
+            <div>
+                <strong>Webtunnel Support:</strong>
+                <span id="snowflakeStatus" class="status not-installed">Not installed</span>
+            </div>
+            <button id="installSnowflakeBtn">Install Snowflake</button>
         </div>
         
-        <label>Select Bridge Type:</label>
-        <div class="bridge-btn-group">
-            <button class="bridge-btn" data-bridge-type="obfs4">obfs4</button>
-            <button class="bridge-btn" data-bridge-type="meek">Meek</button>
-            <button class="bridge-btn" data-bridge-type="none">None</button>
+        <div class="bridge-type-selector">
+            <button class="bridge-type-btn" data-bridge-type="custom">Custom Bridges</button>
+            <button class="bridge-type-btn" data-bridge-type="none">No Bridges</button>
         </div>
         
         <div class="custom-bridges-section">
-            <div class="custom-toggle">
-                <input type="checkbox" id="useCustomBridges">
-                <label for="useCustomBridges">Use Custom Bridges</label>
-            </div>
+            <label>Custom Bridges (one per line):</label>
+            <textarea id="customBridgesText" class="custom-bridges-textarea" 
+                      placeholder="Supported formats:&#10;&#10;obfs4 1.2.3.4:1234 cert=ABCDEF iat-mode=0&#10;webtunnel [2001:db8::1]:443 FINGERPRINT url=https://example.com/ ver=0.0.3&#10;meek 0.0.2.0:2 url=https://meek.azureedge.net/ front=ajax.aspnetcdn.com"></textarea>
             
-            <div id="customBridgesArea" style="display: none;">
-                <label>Custom Bridges (one per line):</label>
-                <textarea id="customBridgesText" class="custom-bridges-textarea" 
-                          placeholder="Example:&#10;obfs4 1.2.3.4:1234 cert=ABCDEF iat-mode=0&#10;obfs4 5.6.7.8:5678 cert=GHIJKL iat-mode=1"></textarea>
+            <div class="bridge-examples">
+                <strong>Examples:</strong>
+                <code>obfs4 185.220.101.204:443 8FB9F4319E89E5C6223052AA525A192AFBC85D55 cert=GGGS1TX4R81m3r0HBl79wKy1OtPPNR2CZUIrHjkRg65Vc2VR8fOyo64f9kmT1UAFG7j0HQ iat-mode=0</code>
+                <code>webtunnel [2001:db8:adeb:7e0f:5140:7cd5:28b1:4503]:443 32F772D0970C2849B2B5BF9F0EC9D3F878DAEA43 url=https://files.bitrot.cz/Bho2k74VTFX6Bwr2XJG5V8gLhZEKgRQ5 ver=0.0.3</code>
                 
-                <div class="bridge-examples">
-                    <strong>Examples:</strong>
-                    <code>obfs4 1.2.3.4:1234 cert=ABCDEF iat-mode=0</code>
-                    <code>meek 0.0.2.0:2 url=https://meek.azureedge.net/ front=ajax.aspnetcdn.com</code>
-                    <div style="margin-top: 8px;">
-                        Get real bridges from: <a href="https://bridges.torproject.org/" target="_blank" style="color: #4dabf7;">bridges.torproject.org</a>
-                    </div>
+                <div style="margin-top: 10px;">
+                    Get bridges from: <a href="https://bridges.torproject.org/" target="_blank" style="color: #4dabf7;">bridges.torproject.org</a>
                 </div>
             </div>
         </div>
         
-        <button id="saveBridgeBtn" class="save-bridge-btn">Save Bridge Settings</button>
+        <button id="saveBridgeBtn" class="save-bridge-btn">Save & Apply Bridge Settings</button>
     </div>
 
     <div class="debug-log-container">
@@ -479,58 +528,57 @@ h2{
     const statusIndicator = document.getElementById('statusIndicator');
     const ipText = document.getElementById('ipText');
     const bridgeModeText = document.getElementById('bridgeModeText');
-    const activeBridgeText = document.getElementById('activeBridgeText');
-    const logOutput = document.getElementById('log-output');
-    const bridgeButtons = document.querySelectorAll('.bridge-btn-group .bridge-btn');
-    const useCustomCheckbox = document.getElementById('useCustomBridges');
-    const customBridgesArea = document.getElementById('customBridgesArea');
     const customBridgesText = document.getElementById('customBridgesText');
     const saveBridgeBtn = document.getElementById('saveBridgeBtn');
+    const bridgeTypeButtons = document.querySelectorAll('.bridge-type-btn');
+    const snowflakeInfo = document.getElementById('snowflakeInfo');
+    const snowflakeStatus = document.getElementById('snowflakeStatus');
+    const installSnowflakeBtn = document.getElementById('installSnowflakeBtn');
     
     let currentSettings = {
-        bridge: 'obfs4',
-        use_custom: '0',
+        bridge: 'custom',
+        use_custom: '1',
         custom_bridges: ''
     };
     
     let isApplying = false;
 
-    function resetBridgeButtons() {
-        bridgeButtons.forEach(btn => {
-            btn.classList.remove('selected-bridge', 'disabled');
-            btn.innerText = btn.dataset.bridgeType.charAt(0).toUpperCase() + btn.dataset.bridgeType.slice(1);
+    function checkSnowflake() {
+        XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=check_snowflake', null, function(x, data) {
+            if (data && data.installed) {
+                snowflakeStatus.textContent = 'Installed';
+                snowflakeStatus.className = 'status installed';
+                installSnowflakeBtn.style.display = 'none';
+            } else {
+                snowflakeStatus.textContent = 'Not installed';
+                snowflakeStatus.className = 'status not-installed';
+                installSnowflakeBtn.style.display = 'inline-block';
+            }
         });
     }
 
     function updateUIFromSettings() {
-        // Обновляем активный тип моста
-        activeBridgeText.innerText = currentSettings.bridge;
+        bridgeModeText.innerText = currentSettings.bridge === 'none' ? 'Direct Connection' : 'Custom Bridges';
         
-        // Обновляем режим мостов
-        const isCustom = currentSettings.use_custom === '1';
-        bridgeModeText.innerText = isCustom ? 'Custom Bridges' : 'Standard Bridges';
-        
-        // Обновляем кнопки
-        resetBridgeButtons();
-        bridgeButtons.forEach(btn => {
-            if (!isCustom && btn.dataset.bridgeType === currentSettings.bridge) {
-                btn.classList.add('selected-bridge');
+        // Обновляем кнопки типа моста
+        bridgeTypeButtons.forEach(btn => {
+            btn.classList.remove('selected');
+            if (btn.dataset.bridgeType === currentSettings.bridge) {
+                btn.classList.add('selected');
             }
         });
         
-        // Обновляем чекбокс и текстовое поле
-        useCustomCheckbox.checked = isCustom;
-        customBridgesArea.style.display = isCustom ? 'block' : 'none';
+        // Обновляем текстовое поле
         customBridgesText.value = currentSettings.custom_bridges || '';
         
-        // Если кастомные мосты, деактивируем стандартные кнопки
-        bridgeButtons.forEach(btn => {
-            if (isCustom) {
-                btn.classList.add('disabled');
-            } else {
-                btn.classList.remove('disabled');
-            }
-        });
+        // Если выбран "none", деактивируем текстовое поле
+        if (currentSettings.bridge === 'none') {
+            customBridgesText.disabled = true;
+            customBridgesText.placeholder = 'Bridges disabled (direct connection)';
+        } else {
+            customBridgesText.disabled = false;
+            customBridgesText.placeholder = 'Paste your bridges here...';
+        }
     }
 
     function updateConnectionUI(running, ip) {
@@ -543,9 +591,9 @@ h2{
 
         if (!isApplying) {
             connectBtn.classList.remove('disabled');
-            connectBtn.innerText = 'Connect';
+            connectBtn.innerText = 'Start Tor';
             disconnectBtn.classList.remove('disabled');
-            disconnectBtn.innerText = 'Disconnect';
+            disconnectBtn.innerText = 'Stop Tor';
         }
     }
 
@@ -553,10 +601,10 @@ h2{
         isApplying = true;
         if (connectBtn.style.display !== 'none') {
             connectBtn.classList.add('disabled');
-            connectBtn.innerText = 'Connecting...';
+            connectBtn.innerText = 'Starting...';
         } else {
             disconnectBtn.classList.add('disabled');
-            disconnectBtn.innerText = 'Disconnecting...';
+            disconnectBtn.innerText = 'Stopping...';
         }
         
         XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=toggle', null, function(x, data) {
@@ -565,46 +613,35 @@ h2{
     }
 
     function saveBridgeSettings() {
-        const useCustom = useCustomCheckbox.checked ? '1' : '0';
-        let bridgeType = currentSettings.bridge;
-        
-        // Если не используем кастомные, берем выбранный тип
-        if (useCustom === '0') {
-            const selectedBtn = document.querySelector('.bridge-btn.selected-bridge');
-            if (selectedBtn) {
-                bridgeType = selectedBtn.dataset.bridgeType;
-            }
-        }
-        
+        const selectedBtn = document.querySelector('.bridge-type-btn.selected');
+        const bridgeType = selectedBtn ? selectedBtn.dataset.bridgeType : 'custom';
         const customBridges = customBridgesText.value.trim();
         
-        // Валидация для кастомных мостов
-        if (useCustom === '1' && customBridges === '') {
-            alert('Please enter custom bridges or disable custom mode.');
+        // Валидация
+        if (bridgeType !== 'none' && customBridges === '') {
+            alert('Please enter bridges or select "No Bridges"');
             return;
         }
         
         saveBridgeBtn.classList.add('disabled');
-        saveBridgeBtn.innerText = 'Saving...';
+        saveBridgeBtn.innerText = 'Applying...';
         
-        // Отправляем все данные одним запросом
         const params = new URLSearchParams({
             action: 'save_bridge',
             bridge_type: bridgeType,
-            use_custom: useCustom,
-            custom_bridges: customBridges
+            use_custom: '1',
+            custom_bridges: bridgeType === 'none' ? '' : customBridges
         });
         
         XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?' + params.toString(), null, function(x, data) {
             saveBridgeBtn.classList.remove('disabled');
-            saveBridgeBtn.innerText = 'Save Bridge Settings';
+            saveBridgeBtn.innerText = 'Save & Apply Bridge Settings';
             
             if (data && data.success) {
-                alert('Bridge settings applied successfully! Tor service is restarting...');
-                // Обновляем статус после сохранения
-                setTimeout(loadStatus, 2000);
+                alert('Settings applied! Tor is restarting...');
+                setTimeout(loadStatus, 3000);
             } else {
-                alert('Failed to apply bridge settings.');
+                alert('Failed to apply settings.');
             }
         });
     }
@@ -613,8 +650,8 @@ h2{
         XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=status', null, function(x, st) {
             if (!st) return;
             
-            currentSettings.bridge = st.bridge || 'obfs4';
-            currentSettings.use_custom = st.use_custom || '0';
+            currentSettings.bridge = st.bridge || 'custom';
+            currentSettings.use_custom = st.use_custom || '1';
             currentSettings.custom_bridges = st.custom_bridges || '';
             
             updateUIFromSettings();
@@ -635,60 +672,60 @@ h2{
         }
     });
     
-    bridgeButtons.forEach(btn => {
+    bridgeTypeButtons.forEach(btn => {
         btn.addEventListener('click', function() {
-            if (this.classList.contains('disabled')) {
-                return;
+            bridgeTypeButtons.forEach(b => b.classList.remove('selected'));
+            this.classList.add('selected');
+            
+            // Обновляем placeholder в зависимости от типа
+            const type = this.dataset.bridgeType;
+            if (type === 'custom') {
+                customBridgesText.placeholder = 'Paste bridges (obfs4, webtunnel, meek)...';
+            } else if (type === 'none') {
+                customBridgesText.placeholder = 'Bridges disabled (direct connection)';
+                customBridgesText.value = '';
             }
-            
-            // Снимаем выделение со всех кнопок
-            bridgeButtons.forEach(b => b.classList.remove('selected-bridge'));
-            // Выделяем нажатую кнопку
-            this.classList.add('selected-bridge');
-            
-            // Если выбрана кнопка, выключаем кастомные мосты
-            useCustomCheckbox.checked = false;
-            customBridgesArea.style.display = 'none';
         });
     });
     
-    useCustomCheckbox.addEventListener('change', function() {
-        customBridgesArea.style.display = this.checked ? 'block' : 'none';
-        
-        if (this.checked) {
-            // Включаем кастомные мосты - деактивируем стандартные кнопки
-            bridgeButtons.forEach(btn => btn.classList.add('disabled'));
-            bridgeButtons.forEach(btn => btn.classList.remove('selected-bridge'));
-        } else {
-            // Выключаем кастомные мосты - активируем стандартные кнопки
-            bridgeButtons.forEach(btn => btn.classList.remove('disabled'));
-            // Восстанавливаем выделение
-            const activeBtn = Array.from(bridgeButtons).find(
-                btn => btn.dataset.bridgeType === currentSettings.bridge
-            );
-            if (activeBtn) {
-                activeBtn.classList.add('selected-bridge');
-            }
+    saveBridgeBtn.addEventListener('click', saveBridgeSettings);
+    
+    installSnowflakeBtn.addEventListener('click', function() {
+        if (confirm('Install snowflake-client in RAM? This will download ~10MB package.')) {
+            installSnowflakeBtn.classList.add('disabled');
+            installSnowflakeBtn.innerText = 'Installing...';
+            
+            // Запускаем скрипт установки
+            XHR.get('/cgi-bin/luci/admin/services/torplus_api?action=install_snowflake', null, function(x, data) {
+                installSnowflakeBtn.classList.remove('disabled');
+                installSnowflakeBtn.innerText = 'Install Snowflake';
+                
+                if (data && data.success) {
+                    alert('Snowflake installed! Please wait 30 seconds and refresh page.');
+                    setTimeout(checkSnowflake, 10000);
+                } else {
+                    alert('Installation failed. Run manually: /usr/bin/install-snowflake-ram');
+                }
+            });
         }
     });
-    
-    saveBridgeBtn.addEventListener('click', saveBridgeSettings);
 
     // Initial load
     loadStatus();
+    checkSnowflake();
     
-    // Initial log load
+    // Load debug log
     XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=get_debug_log', null, function(x, data) {
         if (data && data.log) {
-            logOutput.textContent = data.log;
+            document.getElementById('log-output').textContent = data.log;
         }
     });
 
     // Background polling
     XHR.poll(5, '<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=status', null, function(x, st) {
         if (st) {
-            currentSettings.bridge = st.bridge || 'obfs4';
-            currentSettings.use_custom = st.use_custom || '0';
+            currentSettings.bridge = st.bridge || 'custom';
+            currentSettings.use_custom = st.use_custom || '1';
             currentSettings.custom_bridges = st.custom_bridges || '';
             
             updateUIFromSettings();
@@ -696,11 +733,17 @@ h2{
         }
     });
 
+    XHR.poll(30, '<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=check_snowflake', null, function(x, data) {
+        if (data) {
+            checkSnowflake();
+        }
+    });
+
     XHR.poll(2, '<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=get_debug_log', null, function(x, data) {
         if (data && data.log) {
+            const logOutput = document.getElementById('log-output');
             logOutput.textContent = data.log;
-            const isScrolledToBottom = logOutput.scrollHeight - logOutput.clientHeight <= logOutput.scrollTop + 20;
-            if(isScrolledToBottom) {
+            if(logOutput.scrollHeight - logOutput.clientHeight <= logOutput.scrollTop + 20) {
                 logOutput.scrollTop = logOutput.scrollHeight;
             }
         }
@@ -715,56 +758,145 @@ EoL
     rm -f /usr/lib/lua/luci/view/torplus_status_section.htm 2>/dev/null
     
     # Create and clear the debug log file
-    echo "TORPlus installation started at $(date)" > "$DEBUG_LOG_FILE"
+    echo "TORPlus Webtunnel Edition installation started at $(date)" > "$DEBUG_LOG_FILE"
 
-    # Write the initial torrc file with obfs4 bridge as default
+    # Write the initial torrc file
     cat > /etc/tor/torrc << 'EOF'
 SocksPort 9050
 UseBridges 1
-ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy
-Bridge obfs4 192.0.2.2:2 cert=ABC iat-mode=0
-# Add real bridges from: https://bridges.torproject.org/
-# Example: Bridge obfs4 1.2.3.4:1234 cert=ABCDEF iat-mode=0
+
+# Custom bridges configuration
+# Paste your bridges below (obfs4, webtunnel, or meek):
+
+# Example obfs4:
+# obfs4 185.220.101.204:443 8FB9F4319E89E5C6223052AA525A192AFBC85D55 cert=GGGS1TX4R81m3r0HBl79wKy1OtPPNR2CZUIrHjkRg65Vc2VR8fOyo64f9kmT1UAFG7j0HQ iat-mode=0
+
+# Example webtunnel:
+# webtunnel [2001:db8::1]:443 FINGERPRINT url=https://example.com/ ver=0.0.3
 EOF
     
     # Enable and start the Tor service
     /etc/init.d/tor enable
     /etc/init.d/tor restart
     
-    # Configure Passwall or Passwall2 with detailed settings
-    if uci show passwall2 >/dev/null 2>&1; then
-        echo "Configuring Passwall2..."
-        uci set passwall2.TorNode=nodes
-        uci set passwall2.TorNode.remarks='Tor'
-        uci set passwall2.TorNode.type='Xray'
-        uci set passwall2.TorNode.protocol='socks'
-        uci set passwall2.TorNode.server='127.0.0.1'
-        uci set passwall2.TorNode.port='9050'
-        uci set passwall2.TorNode.address='127.0.0.1'
-        uci set passwall2.TorNode.tls='0'
-        uci set passwall2.TorNode.transport='tcp'
-        uci set passwall2.TorNode.tcp_guise='none'
-        uci set passwall2.TorNode.tcpMptcp='0'
-        uci set passwall2.TorNode.tcpNoDelay='0'
-        uci commit passwall2
-        echo "Passwall2 configured with TOR node."
-    elif uci show passwall >/dev/null 2>&1; then
-        echo "Configuring Passwall..."
-        uci set passwall.TorNode=nodes
-        uci set passwall.TorNode.remarks='Tor'
-        uci set passwall.TorNode.type='Xray'
-        uci set passwall.TorNode.protocol='socks'
-        uci set passwall.TorNode.server='127.0.0.1'
-        uci set passwall.TorNode.port='9050'
-        uci set passwall.TorNode.address='127.0.0.1'
-        uci set passwall.TorNode.tls='0'
-        uci set passwall.TorNode.transport='tcp'
-        uci set passwall.TorNode.tcp_guise='none'
-        uci set passwall.TorNode.tcpMptcp='0'
-        uci set passwall.TorNode.tcpNoDelay='0'
-        uci commit passwall
-        echo "Passwall configured with TOR node."
+    # Create snowflake installer script
+    cat > /usr/bin/install-snowflake-ram << 'EOF'
+#!/bin/sh
+# Snowflake RAM Installer for mipsel_24kc
+
+echo "=== Snowflake RAM Installer ==="
+echo "Installing snowflake-client to RAM..."
+
+# 1. Create RAM disk
+RAM_DIR="/tmp/snowflake_ram"
+SIZE="15M"
+
+echo "1. Creating RAM disk ($SIZE)..."
+mkdir -p $RAM_DIR
+mount -t tmpfs tmpfs $RAM_DIR -o size=$SIZE || {
+    echo "ERROR: Cannot create RAM disk!"
+    exit 1
+}
+
+# 2. Download snowflake-proxy
+echo "2. Downloading snowflake..."
+cd $RAM_DIR
+SNOWFLAKE_URL="https://downloads.openwrt.org/releases/24.10.0/packages/mipsel_24kc/packages/snowflake-proxy_2.11.0-r1_mipsel_24kc.ipk"
+
+if ! wget --timeout=60 --tries=3 -q -O snowflake.ipk "$SNOWFLAKE_URL"; then
+    echo "ERROR: Cannot download snowflake!"
+    exit 1
+fi
+
+# 3. Extract only snowflake-client
+echo "3. Extracting snowflake-client..."
+ar x snowflake.ipk 2>/dev/null || {
+    echo "Trying alternative extraction..."
+    tar -xzf snowflake.ipk 2>/dev/null || tar -xf snowflake.ipk 2>/dev/null
+}
+
+if [ -f "data.tar.gz" ]; then
+    tar -xzf data.tar.gz
+elif [ -f "data.tar.xz" ]; then
+    tar -xJf data.tar.xz
+fi
+
+# 4. Find snowflake-client
+echo "4. Finding snowflake-client..."
+SNOWFLAKE_BIN=""
+for path in "usr/bin/snowflake-client" "usr/sbin/snowflake-client"; do
+    if [ -f "$path" ]; then
+        SNOWFLAKE_BIN="$path"
+        break
     fi
+done
+
+if [ -z "$SNOWFLAKE_BIN" ]; then
+    SNOWFLAKE_BIN=$(find . -name "*snowflake-client*" -type f | head -1)
+fi
+
+if [ -z "$SNOWFLAKE_BIN" ] || [ ! -f "$SNOWFLAKE_BIN" ]; then
+    echo "ERROR: Cannot find snowflake-client in package!"
+    exit 1
+fi
+
+# 5. Install
+echo "5. Installing..."
+chmod +x "$SNOWFLAKE_BIN"
+mkdir -p /usr/bin
+ln -sf "$RAM_DIR/$SNOWFLAKE_BIN" /usr/bin/snowflake-client
+
+# 6. Cleanup
+echo "6. Cleaning up..."
+rm -f snowflake.ipk data.tar.gz control.tar.gz debian-binary 2>/dev/null
+
+# 7. Verify
+echo "7. Verifying installation..."
+if [ -f "/usr/bin/snowflake-client" ]; then
+    echo "✓ Snowflake installed successfully!"
+    echo "  Location: /usr/bin/snowflake-client"
+    echo "  Real path: $(readlink -f /usr/bin/snowflake-client)"
+    echo ""
+    echo "Note: Snowflake is installed in RAM and will disappear after reboot."
+    echo "To install permanently, add to /etc/rc.local:"
+    echo "  /usr/bin/install-snowflake-ram"
+    exit 0
+else
+    echo "✗ Installation failed!"
+    exit 1
+fi
+EOF
+
+    chmod +x /usr/bin/install-snowflake-ram
+    
+    # Create autostart script
+    cat > /etc/init.d/snowflake-autostart << 'EOF'
+#!/bin/sh /etc/rc.common
+
+START=99
+
+start() {
+    # Wait for network
+    sleep 20
+    
+    # Check if snowflake is needed (webtunnel bridges in config)
+    if [ -f /etc/tor/torrc ] && grep -q "webtunnel" /etc/tor/torrc; then
+        if [ ! -f /usr/bin/snowflake-client ]; then
+            logger -t snowflake "Installing snowflake to RAM..."
+            /usr/bin/install-snowflake-ram
+        fi
+    fi
+}
+
+stop() {
+    # Cleanup on stop
+    umount /tmp/snowflake_ram 2>/dev/null
+    rm -rf /tmp/snowflake_ram
+}
+EOF
+
+    chmod +x /etc/init.d/snowflake-autostart
+    /etc/init.d/snowflake-autostart enable
     
     echo "TORPlus installation completed successfully."
 }
@@ -772,40 +904,39 @@ EOF
 # Run the installation function
 install_torplus
 
-# Clear LuCI cache and restart uhttpd to display the new page
+# Clear LuCI cache and restart uhttpd
 echo "Reloading LuCI UI..."
 rm -rf /tmp/luci-* 2>/dev/null
 rm -f /var/run/luci-indexcache 2>/dev/null
-rm -f /www/luci-static/resources/cbi.js 2>/dev/null
 
-# Restart uhttpd
 if [ -f /etc/init.d/uhttpd ]; then
     /etc/init.d/uhttpd restart 2>/dev/null || /etc/init.d/uhttpd reload 2>/dev/null
 fi
 
-echo "Operation completed successfully."
-
 cat << "EOM"
 
 ================================================
-TORPlus with Custom Bridges Support Installed!
+TORPlus with Webtunnel Support Installed!
 
 Features:
-✓ Standard bridges (obfs4, meek, none)
-✓ Custom bridges input
-✓ Bridge settings saved to UCI config
-✓ Real-time status monitoring
+✓ Custom bridges (obfs4, webtunnel, meek)
+✓ Snowflake-client installer in RAM
+✓ Webtunnel bridge support
+✓ No fake bridges
 
-How to use custom bridges:
-1. Get bridges from: https://bridges.torproject.org/
-2. Enable "Use Custom Bridges" checkbox
-3. Paste bridges (one per line)
-4. Click "Save Bridge Settings"
+Important:
+1. For webtunnel bridges, install snowflake:
+   /usr/bin/install-snowflake-ram
+   
+2. Get bridges from:
+   https://bridges.torproject.org/
 
-Example bridge format:
-obfs4 1.2.3.4:1234 cert=ABCDEF iat-mode=0
+3. Supported bridge formats:
+   - obfs4 IP:port cert=FINGERPRINT iat-mode=0
+   - webtunnel [IP]:port FINGERPRINT url=URL ver=VERSION
+   - meek IP:port url=URL front=DOMAIN
 
 Access: Services → TORPlus in LuCI
-SOCKS5 Proxy: 127.0.0.1:9050
+SOCKS5: 127.0.0.1:9050
 ================================================
 EOM
