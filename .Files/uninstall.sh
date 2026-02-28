@@ -68,7 +68,7 @@ log_success "Log files cleaned up."
 
 # 7. Uninstall packages
 log_info "Uninstalling packages (tor, snowflake-client, obfs4proxy, etc.)..."
-opkg remove tor ca-certificates snowflake-client obfs4proxy >/dev/null 2>&1 || true
+apk del tor ca-certificates snowflake-client obfs4proxy >/dev/null 2>&1 || true
 log_success "Dependent packages removed."
 
 # 8. Clear LuCI cache and restart web server
