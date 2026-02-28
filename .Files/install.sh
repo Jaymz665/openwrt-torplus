@@ -1,39 +1,46 @@
 #!/bin/sh
 
-# PeDitXOS Tools - TORPlus Installer v35.1 (Webtunnel Support with apk --dest ram)
+# PeDitXOS Tools - TORPlus Installer v36.0 (APK + Webtunnel Support)
 
-echo ">>> Starting TORPlus installation..."
+echo ">>> Starting TORPlus installation (APK version)..."
+
 LOG_FILE="/tmp/peditxos_torplus_log.txt"
 DEBUG_LOG_FILE="/tmp/torplus_debug.log"
 
-# Function to show progress for long tasks
-run_with_heartbeat() {
-    COMMAND_TO_RUN="$1"
-    ( eval "$COMMAND_TO_RUN" ) &
-    CMD_PID=$!
-    while kill -0 $CMD_PID >/dev/null 2>&1; do
-        echo -n "."
-        sleep 3
-    done
-    wait $CMD_PID
-    return $?
+# Функция для проверки наличия команды
+check_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "Installing $1..."
+        apk add "$2"
+    fi
 }
 
 # --- Main TORPlus installation function ---
 install_torplus() {
+    echo "Updating APK repositories..."
+    apk update
+
     echo "Installing required packages..."
-    run_with_heartbeat "apk update"
-    echo "Installing core packages..."
-    apk add obfs4proxy tor curl ca-certificates
-    echo "Installing LuCI dependencies..."
-    apk add luci-base luci-compat luci-lib-ipkg
+    # Устанавливаем необходимые пакеты через APK
+    apk add tor obfs4proxy curl ca-certificates
+    apk add luci-compat luci-lib-ipkg 2>/dev/null || echo "Note: Some LuCI packages may not be available in APK"
+    
+    # Установка snowflake (webtunnel) - доступен в community репозитории
+    echo "Adding community repository for snowflake..."
+    echo "http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
+    apk update
+    
+    echo "Installing snowflake (webtunnel support)..."
+    apk add snowflake-client
     
     echo "Creating TORPlus LuCI UI..."
 
-    # Ensure the directory exists before writing the file
+    # Создаем необходимые директории
     mkdir -p /usr/lib/lua/luci/view/torplus
-    
-    # Check and create the UCI config file if it doesn't exist
+    mkdir -p /usr/lib/lua/luci/controller
+    mkdir -p /etc/torplus
+
+    # Проверка и создание UCI конфига
     if [ ! -f /etc/config/torplus ]; then
         echo "Creating UCI configuration for torplus..."
         cat > /etc/config/torplus << 'EOF'
@@ -44,7 +51,7 @@ config settings 'settings'
 EOF
     fi
     
-    # Ensure settings exist
+    # Убеждаемся что настройки существуют
     if ! uci -q get torplus.settings >/dev/null 2>&1; then
         uci set torplus.settings=torplus
         uci set torplus.settings.bridge_type='custom'
@@ -53,8 +60,7 @@ EOF
         uci commit torplus
     fi
 
-    # Write the LuCI controller file with webtunnel support
-    mkdir -p /usr/lib/lua/luci/controller
+    # Пишем LuCI контроллер с поддержкой webtunnel
     cat > /usr/lib/lua/luci/controller/torplus.lua <<'EoL'
 module("luci.controller.torplus", package.seeall)
 
@@ -77,7 +83,7 @@ function api_handler()
     local DEBUG_LOG_FILE = "/tmp/torplus_debug.log"
 
     if action == "status" then
-        local running = sys.call("pgrep -f '/usr/sbin/tor' >/dev/null 2>&1") == 0
+        local running = sys.call("pgrep -f '/usr/bin/tor' >/dev/null 2>&1") == 0
         local ip = "N/A"
         local bridge = uci:get("torplus", "settings", "bridge_type") or "custom"
         local use_custom = uci:get("torplus", "settings", "use_custom") or "1"
@@ -104,7 +110,7 @@ function api_handler()
         })
         
     elseif action == "toggle" then
-        local running = sys.call("pgrep -f '/usr/sbin/tor' >/dev/null 2>&1") == 0
+        local running = sys.call("pgrep -f '/usr/bin/tor' >/dev/null 2>&1") == 0
         if running then
             sys.call("/etc/init.d/tor stop > " .. DEBUG_LOG_FILE .. " 2>&1")
         else
@@ -136,11 +142,15 @@ function api_handler()
         local torrc_content = "SocksPort 9050\n"
         local plugins_added = {}
         
+        -- Проверяем пути для бинарников в Alpine
+        local obfs4_path = "/usr/bin/obfs4proxy"
+        local snowflake_path = "/usr/bin/snowflake-client"
+        local meek_path = "/usr/bin/meek-client"
+        
         if use_custom == "1" and custom_bridges ~= "" then
-            -- Используем кастомные мосты
             torrc_content = torrc_content .. "UseBridges 1\n"
             
-            -- Сначала проходим по всем мостам чтобы определить нужные плагины
+            -- Определяем нужные плагины
             for bridge_line in custom_bridges:gmatch("[^\r\n]+") do
                 local clean_line = bridge_line:gsub("^%s*(.-)%s*$", "%1")
                 if clean_line ~= "" and not clean_line:match("^#") then
@@ -155,19 +165,21 @@ function api_handler()
             end
             
             -- Добавляем плагины
-            if plugins_added["obfs4"] and nixio.fs.access("/usr/bin/obfs4proxy") then
-                torrc_content = torrc_content .. "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n"
+            if plugins_added["obfs4"] and nixio.fs.access(obfs4_path) then
+                torrc_content = torrc_content .. "ClientTransportPlugin obfs4 exec " .. obfs4_path .. "\n"
             end
             
-            if plugins_added["webtunnel"] and nixio.fs.access("/usr/bin/snowflake-client") then
-                torrc_content = torrc_content .. "ClientTransportPlugin webtunnel exec /usr/bin/snowflake-client\n"
-            elseif plugins_added["webtunnel"] then
-                torrc_content = torrc_content .. "# WARNING: snowflake-client not found for webtunnel\n"
-                torrc_content = torrc_content .. "# Run: /usr/bin/install-snowflake-ram\n"
+            if plugins_added["webtunnel"] then
+                if nixio.fs.access(snowflake_path) then
+                    torrc_content = torrc_content .. "ClientTransportPlugin webtunnel exec " .. snowflake_path .. "\n"
+                else
+                    torrc_content = torrc_content .. "# WARNING: snowflake-client not found\n"
+                    torrc_content = torrc_content .. "# Run: apk add snowflake-client\n"
+                end
             end
             
-            if plugins_added["meek"] and nixio.fs.access("/usr/bin/meek-client") then
-                torrc_content = torrc_content .. "ClientTransportPlugin meek exec /usr/bin/meek-client\n"
+            if plugins_added["meek"] and nixio.fs.access(meek_path) then
+                torrc_content = torrc_content .. "ClientTransportPlugin meek exec " .. meek_path .. "\n"
             end
             
             -- Добавляем мосты
@@ -179,21 +191,10 @@ function api_handler()
             end
             
         else
-            -- Стандартные настройки (без фиктивных мостов)
-            if bridge_type == "obfs4" then
-                torrc_content = torrc_content .. "UseBridges 1\n"
-                if nixio.fs.access("/usr/bin/obfs4proxy") then
-                    torrc_content = torrc_content .. "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n"
-                end
-                torrc_content = torrc_content .. "# Add obfs4 bridges in custom section\n"
-            elseif bridge_type == "none" then
-                torrc_content = torrc_content .. "UseBridges 0\n"
-            else
-                torrc_content = torrc_content .. "UseBridges 1\n"
-                torrc_content = torrc_content .. "# Add bridges in custom section\n"
-            end
+            torrc_content = torrc_content .. "UseBridges 0\n"
         end
 
+        -- Записываем конфиг
         local f = io.open("/etc/tor/torrc", "w")
         if f then
             f:write(torrc_content)
@@ -218,12 +219,12 @@ function api_handler()
         http.write_json({log = content})
         
     elseif action == "check_snowflake" then
-        -- Проверяем несколькими способами
+        -- Проверяем установку snowflake
         local has_snowflake = false
         local path = ""
         local version = ""
         
-        -- Способ 1: Проверяем через which
+        -- Проверяем через which
         local handle = io.popen("which snowflake-client 2>/dev/null")
         local which_output = handle:read("*l")
         handle:close()
@@ -233,39 +234,14 @@ function api_handler()
             path = which_output
         end
         
-        -- Способ 2: Проверяем конкретные пути
-        if not has_snowflake then
-            local paths_to_check = {
-                "/usr/bin/snowflake-client",
-                "/usr/sbin/snowflake-client",
-                "/usr/local/bin/snowflake-client",
-                "/bin/snowflake-client"
-            }
-            
-            for _, p in ipairs(paths_to_check) do
-                if nixio.fs.access(p) then
-                    has_snowflake = true
-                    path = p
-                    break
-                end
-            end
-        end
+        -- Проверяем APK статус
+        local apk_handle = io.popen("apk list -I | grep snowflake-client 2>/dev/null")
+        local apk_status = apk_handle:read("*l")
+        apk_handle:close()
         
-        -- Способ 3: Ищем в системе
-        if not has_snowflake then
-            local handle = io.popen("find /usr -name '*snowflake*client*' -type f 2>/dev/null | head -1")
-            local found = handle:read("*l")
-            handle:close()
-            
-            if found and found ~= "" then
-                has_snowflake = true
-                path = found
-            end
-        end
-        
-        -- Получаем версию если установлен
+        -- Получаем версию
         if has_snowflake and path ~= "" then
-            local handle = io.popen(path .. " --version 2>&1 || echo 'unknown'")
+            local handle = io.popen(path .. " --version 2>&1 | head -1 || echo 'unknown'")
             version = handle:read("*l") or "unknown"
             handle:close()
         end
@@ -275,25 +251,13 @@ function api_handler()
             installed = has_snowflake,
             path = path,
             version = version,
-            ram = nixio.fs.access("/tmp/snowflake_status")
+            apk = apk_status ~= nil
         })
         
     elseif action == "install_snowflake" then
-        -- Запускаем установщик
-        sys.call("echo 'Starting snowflake installation...' >> " .. DEBUG_LOG_FILE)
-        local result = sys.exec("/usr/bin/install-snowflake-ram 2>&1")
-        
-        -- Проверяем успешность
+        sys.call("echo 'Starting snowflake installation via APK...' >> " .. DEBUG_LOG_FILE)
+        local result = sys.exec("apk add snowflake-client 2>&1")
         local success = sys.call("which snowflake-client >/dev/null 2>&1") == 0
-        
-        -- Пишем в лог
-        local f = io.open(DEBUG_LOG_FILE, "a")
-        if f then
-            f:write("\n--- Snowflake installation ---\n")
-            f:write(result)
-            f:write("\nSuccess: " .. tostring(success) .. "\n")
-            f:close()
-        end
         
         http.prepare_content("application/json")
         http.write_json({
@@ -304,7 +268,7 @@ function api_handler()
 end
 EoL
     
-    # Write the LuCI view file с поддержкой webtunnel
+    # Пишем LuCI view файл с поддержкой webtunnel
     cat > /usr/lib/lua/luci/view/torplus/main.htm <<'EoL'
 <%+header%>
 <style>
@@ -431,11 +395,6 @@ h2{
     color: #fff;
     transform: scale(1.05);
 }
-.bridge-type-btn.disabled {
-    cursor: not-allowed;
-    background-color: rgba(255, 255, 255, 0.05);
-    color: #999;
-}
 .snowflake-info {
     background: rgba(0, 123, 255, 0.1);
     border-left: 4px solid #007bff;
@@ -538,10 +497,17 @@ h2{
     color: #aaa;
     margin-top: 5px;
 }
+.apk-badge {
+    background: #4a6da7;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    margin-left: 5px;
+}
 </style>
 
 <div class="torplus-container">
-    <h2>TORPlus Manager (Webtunnel Support)</h2>
+    <h2>TORPlus Manager <span class="apk-badge">APK</span></h2>
 
     <div class="torplus-row">
         <span class="torplus-label">Service Status:</span>
@@ -569,11 +535,11 @@ h2{
         
         <div id="snowflakeInfo" class="snowflake-info">
             <div>
-                <strong>Webtunnel Support:</strong>
+                <strong>Webtunnel Support (Snowflake):</strong>
                 <span id="snowflakeStatus" class="status not-installed">Checking...</span>
                 <div id="snowflakeDetails" class="snowflake-details"></div>
             </div>
-            <button id="installSnowflakeBtn">Install Snowflake</button>
+            <button id="installSnowflakeBtn">Install via APK</button>
         </div>
         
         <div class="bridge-type-selector">
@@ -634,22 +600,19 @@ h2{
         XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=check_snowflake', null, function(x, data) {
             if (data) {
                 if (data.installed) {
-                    snowflakeStatus.textContent = 'Installed';
+                    snowflakeStatus.textContent = 'Installed (APK)';
                     snowflakeStatus.className = 'status installed';
                     installSnowflakeBtn.style.display = 'none';
                     
-                    // Показываем детали
                     let details = '';
                     if (data.path) details += 'Path: ' + data.path + '\n';
                     if (data.version) details += 'Version: ' + data.version;
-                    if (data.ram) details += ' (RAM)';
-                    
                     snowflakeDetails.textContent = details;
                 } else {
                     snowflakeStatus.textContent = 'Not installed';
                     snowflakeStatus.className = 'status not-installed';
                     installSnowflakeBtn.style.display = 'inline-block';
-                    snowflakeDetails.textContent = 'Required for webtunnel bridges';
+                    snowflakeDetails.textContent = 'Run: apk add snowflake-client';
                 }
             }
         });
@@ -658,7 +621,6 @@ h2{
     function updateUIFromSettings() {
         bridgeModeText.innerText = currentSettings.bridge === 'none' ? 'Direct Connection' : 'Custom Bridges';
         
-        // Обновляем кнопки типа моста
         bridgeTypeButtons.forEach(btn => {
             btn.classList.remove('selected');
             if (btn.dataset.bridgeType === currentSettings.bridge) {
@@ -666,10 +628,8 @@ h2{
             }
         });
         
-        // Обновляем текстовое поле
         customBridgesText.value = currentSettings.custom_bridges || '';
         
-        // Если выбран "none", деактивируем текстовое поле
         if (currentSettings.bridge === 'none') {
             customBridgesText.disabled = true;
             customBridgesText.placeholder = 'Bridges disabled (direct connection)';
@@ -715,7 +675,6 @@ h2{
         const bridgeType = selectedBtn ? selectedBtn.dataset.bridgeType : 'custom';
         const customBridges = customBridgesText.value.trim();
         
-        // Валидация
         if (bridgeType !== 'none' && customBridges === '') {
             alert('Please enter bridges or select "No Bridges"');
             return;
@@ -758,7 +717,7 @@ h2{
     }
 
     function installSnowflake() {
-        if (confirm('Install snowflake-client in RAM?\nThis will download ~1MB package.\nInstallation will not persist after reboot.')) {
+        if (confirm('Install snowflake-client via APK?\nThis will download and install the package.')) {
             installSnowflakeBtn.classList.add('disabled');
             installSnowflakeBtn.innerText = 'Installing...';
             
@@ -766,10 +725,10 @@ h2{
                 null, 
                 function(x, data) {
                     installSnowflakeBtn.classList.remove('disabled');
-                    installSnowflakeBtn.innerText = 'Install Snowflake';
+                    installSnowflakeBtn.innerText = 'Install via APK';
                     
                     if (data && data.success) {
-                        alert('Snowflake installed successfully!\n' + (data.output || ''));
+                        alert('Snowflake installed successfully via APK!');
                         checkSnowflake();
                         setTimeout(loadStatus, 2000);
                     } else {
@@ -781,24 +740,14 @@ h2{
     }
 
     // Event Listeners
-    connectBtn.addEventListener('click', function() {
-        if (!connectBtn.classList.contains('disabled')) {
-            toggleService();
-        }
-    });
-
-    disconnectBtn.addEventListener('click', function() {
-        if (!disconnectBtn.classList.contains('disabled')) {
-            toggleService();
-        }
-    });
+    connectBtn.addEventListener('click', toggleService);
+    disconnectBtn.addEventListener('click', toggleService);
     
     bridgeTypeButtons.forEach(btn => {
         btn.addEventListener('click', function() {
             bridgeTypeButtons.forEach(b => b.classList.remove('selected'));
             this.classList.add('selected');
             
-            // Обновляем placeholder в зависимости от типа
             const type = this.dataset.bridgeType;
             if (type === 'custom') {
                 customBridgesText.disabled = false;
@@ -818,7 +767,6 @@ h2{
     loadStatus();
     checkSnowflake();
     
-    // Load debug log
     XHR.get('<%=luci.dispatcher.build_url("admin/services/torplus_api")%>?action=get_debug_log', null, function(x, data) {
         if (data && data.log) {
             document.getElementById('log-output').textContent = data.log;
@@ -847,9 +795,6 @@ h2{
         if (data && data.log) {
             const logOutput = document.getElementById('log-output');
             logOutput.textContent = data.log;
-            if(logOutput.scrollHeight - logOutput.clientHeight <= logOutput.scrollTop + 20) {
-                logOutput.scrollTop = logOutput.scrollHeight;
-            }
         }
     });
 })();
@@ -857,246 +802,91 @@ h2{
 <%+footer%>
 EoL
 
-    # Remove old LuCI files to prevent conflicts
+    # Удаляем старые файлы
     rm -f /usr/lib/lua/luci/model/cbi/torplus_manager.lua 2>/dev/null
     rm -f /usr/lib/lua/luci/view/torplus_status_section.htm 2>/dev/null
     
-    # Create and clear the debug log file
-    echo "TORPlus Webtunnel Edition installation started at $(date)" > "$DEBUG_LOG_FILE"
+    # Создаем debug лог
+    echo "TORPlus APK Edition installation started at $(date)" > "$DEBUG_LOG_FILE"
 
-    # Write the initial torrc file
+    # Пишем начальный torrc
     cat > /etc/tor/torrc << 'EOF'
 SocksPort 9050
 UseBridges 1
 
-# Custom bridges configuration
-# Paste your bridges below (obfs4, webtunnel, or meek):
+# Client transport plugins
+ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy
+ClientTransportPlugin webtunnel exec /usr/bin/snowflake-client
 
-# Example obfs4:
-# obfs4 185.220.101.204:443 8FB9F4319E89E5C6223052AA525A192AFBC85D55 cert=GGGS1TX4R81m3r0HBl79wKy1OtPPNR2CZUIrHjkRg65Vc2VR8fOyo64f9kmT1UAFG7j0HQ iat-mode=0
-
-# Example webtunnel:
-# webtunnel [2001:db8::1]:443 FINGERPRINT url=https://example.com/ ver=0.0.3
+# Example bridges (get fresh ones from https://bridges.torproject.org/)
 EOF
     
-    # Enable and start the Tor service
-    /etc/init.d/tor enable
-    /etc/init.d/tor restart
+    # Включаем и запускаем Tor
+    if [ -f /etc/init.d/tor ]; then
+        /etc/init.d/tor enable
+        /etc/init.d/tor restart
+    else
+        echo "Warning: Tor init script not found, starting manually"
+        tor --runasdaemon 1
+    fi
     
-    # Create snowflake installer script (using apk --dest ram)
-    cat > /usr/bin/install-snowflake-ram << 'EOF'
+    # Создаем скрипт проверки для APK
+    cat > /usr/bin/check-torplus.sh << 'EOF'
 #!/bin/sh
-# Snowflake RAM Installer using apk --dest ram
-
-echo "=== Snowflake RAM Installer ==="
-echo "Using apk --dest ram installation..."
-
-# 1. Переходим в /tmp
-cd /tmp
-
-# 2. Скачиваем пакет
-echo "1. Downloading snowflake package..."
-PKG_URL="https://downloads.openwrt.org/releases/24.10.0/packages/mipsel_24kc/packages/snowflake-proxy_2.11.0-r1_mipsel_24kc.ipk"
-PKG_FILE="snowflake-proxy_2.11.0-r1_mipsel_24kc.ipk"
-
-if [ ! -f "$PKG_FILE" ] || [ ! -s "$PKG_FILE" ]; then
-    echo "Downloading from $PKG_URL"
-    wget --timeout=30 --tries=2 -q -O "$PKG_FILE" "$PKG_URL" || {
-        echo "ERROR: Download failed!"
-        echo "Trying alternative mirror..."
-        wget --timeout=30 -q -O "$PKG_FILE" \
-            "https://archive.openwrt.org/releases/24.10.0/packages/mipsel_24kc/packages/snowflake-proxy_2.11.0-r1_mipsel_24kc.ipk" || {
-            echo "FATAL: Cannot download package"
-            exit 1
-        }
-    }
-fi
-
-# 3. Устанавливаем в RAM с помощью apk
-echo "2. Installing to RAM with apk --dest ram..."
-if apk add --dest ram "$PKG_FILE" 2>&1; then
-    echo "✓ Package installed to RAM via apk"
+echo "=== TORPlus APK Status ==="
+echo ""
+echo "Installed packages:"
+apk list -I | grep -E "tor|obfs4|snowflake|meek"
+echo ""
+echo "Tor status:"
+if pgrep -f '/usr/bin/tor' >/dev/null 2>&1; then
+    echo "Tor: RUNNING"
+    echo "IP: $(curl --socks5 127.0.0.1:9050 -s http://ifconfig.me/ip 2>/dev/null || echo 'N/A')"
 else
-    echo "WARNING: apk add failed, trying manual extraction..."
-    
-    # Альтернатива: распаковываем вручную
-    mkdir -p /tmp/snowflake_extract
-    cd /tmp/snowflake_extract
-    
-    # .ipk файл это на самом деле .tar.gz
-    if file "/tmp/$PKG_FILE" | grep -q "gzip"; then
-        tar -xzf "/tmp/$PKG_FILE"
-    else
-        tar -xf "/tmp/$PKG_FILE"
-    fi
-    
-    # Ищем snowflake-client в распакованных файлах
-    SNOWFLAKE_BIN=""
-    
-    # Сначала ищем в data.tar.gz/xz
-    for data_file in data.tar.gz data.tar.xz; do
-        if [ -f "$data_file" ]; then
-            echo "Extracting $data_file..."
-            if echo "$data_file" | grep -q "gz"; then
-                tar -xzf "$data_file"
-            else
-                tar -xJf "$data_file"
-            fi
-        fi
-    done
-    
-    # Ищем бинарник
-    SNOWFLAKE_BIN=$(find . -type f -name "*snowflake*client*" 2>/dev/null | head -1)
-    
-    if [ -f "$SNOWFLAKE_BIN" ]; then
-        echo "Found: $SNOWFLAKE_BIN"
-        chmod +x "$SNOWFLAKE_BIN"
-        
-        # Копируем в /usr/bin
-        mkdir -p /usr/bin 2>/dev/null
-        cp "$SNOWFLAKE_BIN" /usr/bin/snowflake-client
-        chmod +x /usr/bin/snowflake-client
-        
-        echo "✓ Manually installed to /usr/bin/snowflake-client"
-    else
-        echo "✗ Cannot find snowflake-client in package"
-        echo "Contents:"
-        find . -type f 2>/dev/null | head -20
-        exit 1
-    fi
+    echo "Tor: STOPPED"
 fi
-
-# 4. Проверяем установку
-echo "3. Verifying installation..."
-
-# Проверяем несколькими способами
-if which snowflake-client >/dev/null 2>&1; then
-    SNOW_PATH=$(which snowflake-client)
-    echo "✓ Found via which: $SNOW_PATH"
-elif [ -f /usr/bin/snowflake-client ]; then
-    echo "✓ Found: /usr/bin/snowflake-client"
-    SNOW_PATH="/usr/bin/snowflake-client"
-elif [ -f /usr/sbin/snowflake-client ]; then
-    echo "✓ Found: /usr/sbin/snowflake-client"
-    SNOW_PATH="/usr/sbin/snowflake-client"
+echo ""
+echo "Snowflake status:"
+if command -v snowflake-client >/dev/null 2>&1; then
+    echo "Snowflake: INSTALLED"
+    snowflake-client --version 2>&1 | head -1
 else
-    echo "✗ snowflake-client not found in PATH"
-    
-    # Ищем в системе
-    echo "Searching system..."
-    FOUND=$(find /usr -name "*snowflake*" -type f 2>/dev/null | head -1)
-    if [ -n "$FOUND" ]; then
-        echo "Found at: $FOUND"
-        ln -sf "$FOUND" /usr/bin/snowflake-client 2>/dev/null
-        SNOW_PATH="/usr/bin/snowflake-client"
-    else
-        echo "ERROR: snowflake-client not found anywhere!"
-        exit 1
-    fi
-fi
-
-# 5. Тестируем
-echo "4. Testing snowflake-client..."
-if [ -n "$SNOW_PATH" ] && [ -x "$SNOW_PATH" ]; then
-    # Пробуем получить версию
-    echo "Testing binary..."
-    if "$SNOW_PATH" --version 2>&1 | head -1; then
-        echo "✓ Binary works!"
-    elif "$SNOW_PATH" -h 2>&1 | head -1; then
-        echo "✓ Binary responds to -h"
-    else
-        echo "✓ Binary exists and is executable"
-    fi
-    
-    # Создаем маркерный файл для LuCI
-    echo "installed: $(date)" > /tmp/snowflake_status
-    echo "path: $SNOW_PATH" >> /tmp/snowflake_status
-    echo "ram: true" >> /tmp/snowflake_status
-    
-    echo ""
-    echo "=== Installation successful! ==="
-    echo "Snowflake-client installed in RAM"
-    echo "Binary: $SNOW_PATH"
-    echo ""
-    echo "Note: Will not persist after reboot."
-    echo "For auto-install on boot, add to /etc/rc.local:"
-    echo "  sleep 15 && /usr/bin/install-snowflake-ram >/tmp/snowflake.log 2>&1 &"
-    
-    exit 0
-else
-    echo "✗ snowflake-client is not executable"
-    exit 1
+    echo "Snowflake: NOT INSTALLED"
 fi
 EOF
+    chmod +x /usr/bin/check-torplus.sh
 
-    chmod +x /usr/bin/install-snowflake-ram
-    
-    # Create autostart script
-    cat > /etc/init.d/snowflake-autostart << 'EOF'
-#!/bin/sh /etc/rc.common
-
-START=99
-
-start() {
-    # Wait for network
-    sleep 20
-    
-    # Check if snowflake is needed (webtunnel bridges in config)
-    if [ -f /etc/tor/torrc ] && grep -q "webtunnel" /etc/tor/torrc; then
-        if [ ! -f /usr/bin/snowflake-client ]; then
-            logger -t snowflake "Installing snowflake to RAM..."
-            /usr/bin/install-snowflake-ram >/tmp/snowflake_install.log 2>&1 &
-        fi
-    fi
+    echo "TORPlus APK installation completed successfully."
 }
 
-stop() {
-    # Cleanup on stop
-    umount /tmp/snowflake_ram 2>/dev/null
-    rm -rf /tmp/snowflake_ram 2>/dev/null
-}
-EOF
-
-    chmod +x /etc/init.d/snowflake-autostart
-    /etc/init.d/snowflake-autostart enable
-    
-    echo "TORPlus installation completed successfully."
-}
-
-# Run the installation function
+# Запускаем установку
 install_torplus
 
-# Clear LuCI cache and restart uhttpd
-echo "Reloading LuCI UI..."
+# Перезагружаем LuCI
 rm -rf /tmp/luci-* 2>/dev/null
 rm -f /var/run/luci-indexcache 2>/dev/null
 
 if [ -f /etc/init.d/uhttpd ]; then
-    /etc/init.d/uhttpd restart 2>/dev/null || /etc/init.d/uhttpd reload 2>/dev/null
+    /etc/init.d/uhttpd restart 2>/dev/null
 fi
 
 cat << "EOM"
 
 ================================================
-TORPlus with Webtunnel Support Installed!
+TORPlus with Webtunnel Support (APK Version) Installed!
 
 Features:
-✓ Custom bridges (obfs4, webtunnel, meek)
-✓ Snowflake-client installer in RAM
-✓ Webtunnel bridge support
-✓ No fake bridges
+✓ APK package manager support
+✓ Webtunnel bridges via snowflake-client
+✓ obfs4 and meek support
+✓ Persistent installation (not just in RAM)
 
-Important:
-1. For webtunnel bridges, install snowflake:
-   /usr/bin/install-snowflake-ram
-   
-2. Get bridges from:
-   https://bridges.torproject.org/
+Commands:
+  Install packages:  apk add snowflake-client obfs4proxy
+  Check status:      /usr/bin/check-torplus.sh
+  View logs:         tail -f /var/log/tor/log
 
-3. Supported bridge formats:
-   - obfs4 IP:port cert=FINGERPRINT iat-mode=0
-   - webtunnel [IP]:port FINGERPRINT url=URL ver=VERSION
-   - meek IP:port url=URL front=DOMAIN
+Get bridges: https://bridges.torproject.org/
 
 Access: Services → TORPlus in LuCI
 SOCKS5: 127.0.0.1:9050
