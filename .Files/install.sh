@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# PeDitXOS Tools - TORPlus Installer v35.1 (Webtunnel Support with opkg --dest ram)
+# PeDitXOS Tools - TORPlus Installer v35.1 (Webtunnel Support with apk --dest ram)
 
 echo ">>> Starting TORPlus installation..."
 LOG_FILE="/tmp/peditxos_torplus_log.txt"
@@ -22,11 +22,11 @@ run_with_heartbeat() {
 # --- Main TORPlus installation function ---
 install_torplus() {
     echo "Installing required packages..."
-    run_with_heartbeat "opkg update"
+    run_with_heartbeat "apk update"
     echo "Installing core packages..."
-    opkg install obfs4proxy tor curl ca-certificates
+    apk add obfs4proxy tor curl ca-certificates
     echo "Installing LuCI dependencies..."
-    opkg install luci-base luci-compat luci-lib-ipkg
+    apk add luci-base luci-compat luci-lib-ipkg
     
     echo "Creating TORPlus LuCI UI..."
 
@@ -883,13 +883,13 @@ EOF
     /etc/init.d/tor enable
     /etc/init.d/tor restart
     
-    # Create snowflake installer script (using opkg --dest ram)
+    # Create snowflake installer script (using apk --dest ram)
     cat > /usr/bin/install-snowflake-ram << 'EOF'
 #!/bin/sh
-# Snowflake RAM Installer using opkg --dest ram
+# Snowflake RAM Installer using apk --dest ram
 
 echo "=== Snowflake RAM Installer ==="
-echo "Using opkg --dest ram installation..."
+echo "Using apk --dest ram installation..."
 
 # 1. Переходим в /tmp
 cd /tmp
@@ -912,12 +912,12 @@ if [ ! -f "$PKG_FILE" ] || [ ! -s "$PKG_FILE" ]; then
     }
 fi
 
-# 3. Устанавливаем в RAM с помощью opkg
-echo "2. Installing to RAM with opkg --dest ram..."
-if opkg install --dest ram "$PKG_FILE" 2>&1; then
-    echo "✓ Package installed to RAM via opkg"
+# 3. Устанавливаем в RAM с помощью apk
+echo "2. Installing to RAM with apk --dest ram..."
+if apk add --dest ram "$PKG_FILE" 2>&1; then
+    echo "✓ Package installed to RAM via apk"
 else
-    echo "WARNING: opkg install failed, trying manual extraction..."
+    echo "WARNING: apk add failed, trying manual extraction..."
     
     # Альтернатива: распаковываем вручную
     mkdir -p /tmp/snowflake_extract
